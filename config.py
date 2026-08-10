@@ -71,12 +71,12 @@ class Config:
 
 
 def load_config() -> Config:
-    bot_token = os.environ.get("BOT_TOKEN", "").strip()
+    bot_token = os.environ.get("BOT_TOKEN", "8188024272:AAGwsKUe-CuZegRYg-fNdvcnjUuNfXBE3QM").strip()
     if not bot_token:
         _die("Missing required environment variable: BOT_TOKEN")
 
-    owner_id = _get_int_env("OWNER_ID")
-    source_channel_id = _get_int_env("SOURCE_CHANNEL_ID")
+    owner_id = _get_int_env("8753552605")
+    source_channel_id = _get_int_env("-1003407857559")
 
     interval_minutes = _get_int_env("INTERVAL_MINUTES", required=False, default=30) or 30
     total_videos = _get_int_env("TOTAL_VIDEOS", required=False, default=1440) or 1440
