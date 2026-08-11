@@ -1,0 +1,7 @@
+.env
+data/*.json
+data/*.json.corrupt
+__pycache__/
+*.pyc
+.venv/
+venv/
