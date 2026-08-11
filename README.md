@@ -1,247 +1,245 @@
-# Telegram 30-Minute Video Auto Distributor Bot
+# Forwarder-ROBOT
 
-Copies one video from a private source channel to any number of destination
-channels every 30 minutes, forever, using Telegram's native `copyMessage`
-(no re-upload). Position survives restarts; nothing is ever sent twice.
+A production-ready Telegram bot that automatically distributes posts from
+one or more **source channels** to one or more **destination channels** on
+a fixed schedule (default: 1 post every 30 minutes). Fully controllable
+from Telegram — no server console access needed after setup.
+
+Runs on Termux/Android and on any regular Linux VPS.
 
 ---
 
-## 1. Create the bot
+## 1. Installation (Linux / VPS)
 
-1. Open **@BotFather** on Telegram.
-2. Send `/newbot`, follow the prompts.
-3. Copy the token it gives you — this is `BOT_TOKEN`.
+```bash
+git clone <your-repo-url> Forwarder-ROBOT
+cd Forwarder-ROBOT
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# edit .env with your BOT_TOKEN and OWNER_ID
+python3 bot.py
+```
 
-## 2. Find your OWNER_ID
+## 2. Installation (Termux)
 
-1. Open **@userinfobot** (or any similar "what's my ID" bot).
-2. Send it any message; it replies with your numeric Telegram user ID.
-3. That number is `OWNER_ID`.
-
-## 3. Get the Source Channel ID
-
-1. Add your bot to the private source channel **as an administrator**
-   (needs "Post Messages" is not required, but it does need to be able to
-   read channel posts and you should grant it full admin rights to be safe).
-2. Forward any message from that channel to **@userinfobot** (or
-   **@JsonDumpBot** / **@RawDataBot**) — it will show a chat ID like
-   `-1001234567890`. That's `SOURCE_CHANNEL_ID`.
-
-## 4. Add the bot as admin everywhere
-
-- Source channel: admin (required to read channel posts and copy from it).
-- Every destination channel: admin, with "Post Messages" permission.
-
-## 5. Install Python
-
-**Termux:**
 ```bash
 pkg update && pkg upgrade
-pkg install python
-```
-
-**Linux / VPS:** install Python 3.12+ via your distro's package manager.
-
-## 6. Install dependencies
-
-```bash
-cd telegram_video_bot
+pkg install python git
+git clone <your-repo-url> Forwarder-ROBOT
+cd Forwarder-ROBOT
 pip install -r requirements.txt
-```
-(On Termux, use the same command — no extra steps needed.)
-
-## 7. Prepare the 1440-video message ID list
-
-**⚠️ Telegram API limitation, read this carefully:**
-
-A **bot account** cannot fetch arbitrary old history of a channel — the Bot
-API has no "list all past messages" method. This is a Telegram platform
-limitation, not something this project can work around. This bot does **not**
-pretend otherwise. It gives you two honest paths:
-
-**Path A — going forward (automatic, zero effort):**
-Once the bot is an admin in the source channel, it automatically records the
-`message_id` of every new video posted there, in order, into `data/videos.json`.
-If you're setting this up *before* posting your 1440 videos, just add the bot
-first and then post the videos — they'll be captured as they go.
-
-**Path B — for videos already posted (manual, one-time):**
-You need to obtain the message IDs yourself, since only you (as a full user,
-not the bot) can browse existing channel history. Two practical ways:
-- Open the channel in **Telegram Desktop**, and note that each message has a
-  "Copy Message Link" option — the trailing number in that link
-  (`https://t.me/c/XXXXXXXXXX/<message_id>`) is the message ID.
-- Or use a **userbot script** you control (e.g. with Telethon/Pyrogram under
-  your own account, not this bot) to iterate `get_chat_history` and dump the
-  video message IDs to a JSON file. This project intentionally does not
-  include a userbot, since that runs under a different set of Telegram rules
-  than a Bot API bot.
-
-Once you have the list, create a file like:
-```json
-{
-    "videos": [101, 102, 103, 104]
-}
-```
-Send it to the bot as a document, reply to it with:
-```
-/importvideos
-```
-and the IDs will be merged into `data/videos.json` (duplicates are ignored).
-
-Run `/scan` any time for an in-chat reminder of this process and a current count.
-
-## 8. Configure `.env`
-
-```bash
 cp .env.example .env
-```
-Edit `.env`:
-```
-BOT_TOKEN=123456:ABC-your-token
-OWNER_ID=123456789
-SOURCE_CHANNEL_ID=-1001234567890
-
-INTERVAL_MINUTES=30
-TOTAL_VIDEOS=1440
-SHUFFLE=false
-MISSED_SCHEDULE_POLICY=next
-```
-The bot validates these at startup and exits with a clear error if anything
-required is missing.
-
-## 9. Start the bot
-
-```bash
+nano .env   # fill in BOT_TOKEN and OWNER_ID
 python bot.py
 ```
 
-## 10. Add destination channels
+## 3. Python requirements
 
-In your DM with the bot (as the owner):
-```
-/addchannel -1001111111111
-/addchannel -1002222222222
-/channels
-```
-The bot verifies it can actually post in each channel before accepting it.
+- Python 3.12+ (3.14 also supported — dependencies were chosen to avoid
+  packages that force native/Rust compilation, which is a common source
+  of Termux install failures).
+- See `requirements.txt`: `aiogram`, `python-dotenv`, `aiofiles` only.
+  No Flask, FastAPI, psutil, or database drivers.
 
-## 11. Start the schedule
+## 4. `.env` setup
+
+Copy `.env.example` to `.env` and fill in:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `BOT_TOKEN` | Your bot's token from @BotFather | *(required)* |
+| `OWNER_ID` | Your numeric Telegram user ID | *(required)* |
+| `INTERVAL_MINUTES` | Minutes between posts | `30` |
+| `TOTAL_POSTS` | Informational target post count (display only — actual cycle length is however many posts are loaded) | `1440` |
+| `AUTO_QUEUE_NEW_POSTS` | Auto-capture new posts from sources | `true` |
+| `SOURCE_MODE` | `round_robin` or `sequential` | `round_robin` |
+| `MISSED_SCHEDULE_POLICY` | Only `next` is supported — never bursts missed posts | `next` |
+
+`INTERVAL_MINUTES` and `SOURCE_MODE` can also be changed live from Telegram
+with `/setinterval` and `/setsourcemode` — those overrides are stored in
+`data/settings.json` and take priority over `.env`.
+
+**Never** put real credentials in `.env.example` — only `.env` (which is
+git-ignored).
+
+## 5. How to obtain your Telegram user ID
+
+Message [@userinfobot](https://t.me/userinfobot) (or any similar ID bot)
+on Telegram — it replies with your numeric user ID. Use that as
+`OWNER_ID`.
+
+## 6. How to create a bot
+
+1. Message [@BotFather](https://t.me/BotFather).
+2. Send `/newbot` and follow the prompts.
+3. Copy the token it gives you into `BOT_TOKEN`.
+
+## 7. Adding the bot as a source-channel admin
+
+1. Open the source channel → Administrators → Add Admin.
+2. Add your bot, granting at least **"Post Messages"** / read access.
+3. Get the channel's numeric ID (forward a message from it to
+   [@userinfobot](https://t.me/userinfobot), or use any ID-lookup bot) —
+   it looks like `-1001234567890`.
+
+## 8. Adding the bot to destination channels
+
+Same as above: add the bot as **administrator** (it needs "Post Messages"
+permission) in every channel you want content copied into.
+
+## 9. `/addsource`
 
 ```
-/startschedule
-```
-Sends video #1 on the next 30-minute grid tick, then #2, #3, ... wrapping
-back to #1 after #1440, forever.
-
-## 12. Check status
-
-```
-/status
-```
-```
-🤖 Bot Status: ONLINE
-📦 Total Videos: 1440
-▶️ Current Video: 37/1440
-🔁 Cycle: 1
-📢 Destination Channels: 5
-⏰ Interval: 30 minutes
-🕐 Next Video: 12:30 PM
-⚙️ Scheduler: RUNNING
+/addsource -1001234567890
 ```
 
-## 13. Reset the sequence (if you ever need to)
+Verifies the bot can access the chat and is an administrator, then stores
+it in `data/sources.json`.
+
+## 10. `/sources`
+
+Lists every configured source with its live status (`✅ Active` /
+`⚠️ Unavailable`).
+
+## 11. `/addchannel`
 
 ```
-/reset
-```
-Bot asks for confirmation; confirm with:
-```
-/reset YES
+/addchannel -1009876543210
 ```
 
-## 14. Restart recovery
+Same verification flow as `/addsource`, but for destinations.
 
-If the process restarts (crash, redeploy, `pkg upgrade`, VPS reboot):
-- `data/schedule.json` already has the current index, so it **resumes from
-  the correct video** — it never jumps back to #1.
-- If a delivery to some channels succeeded and others hadn't been reached
-  yet when the process died, the bot resumes that *same* video and only
-  sends to the channels that hadn't received it yet — no duplicates, no
-  skips.
-- If the bot was offline through one or more entire 30-minute slots,
-  `MISSED_SCHEDULE_POLICY=next` (the default) makes it resume with just the
-  next video instead of blasting out every video it missed.
+## 12. `/channels`
 
-## 15. Running 24/7 on Termux
+Lists all destination channels and their status.
 
-Termux kills background processes aggressively unless kept alive. Use `tmux`:
+## 13. `/importposts`
+
+Since the Bot API cannot enumerate a channel's old history, reply to a
+`.json` file (uploaded as a Telegram document) with `/importposts`:
+
+```json
+[
+  { "source_chat_id": -1001234567890, "message_id": 101 },
+  { "source_chat_id": -1001234567890, "message_id": 102 }
+]
+```
+
+Invalid entries, unknown sources, and duplicates are skipped and reported
+— the import never crashes on bad data.
+
+## 14. Scheduler setup
+
+```
+/startschedule    start distribution
+/stopschedule     pause distribution
+/status           see current state
+/next             preview the next post
+```
+
+Only one scheduler loop can ever run at a time (duplicate-protected), and
+if the bot was running the scheduler when it stopped, it automatically
+resumes on the next startup.
+
+## 15. 30-minute configuration
+
+Default interval is 30 minutes / 48 posts a day. Change it any time with:
+
+```
+/setinterval 30
+```
+
+## 16. Restart behavior
+
+Progress (`data/schedule.json`) is saved **after** each successful post,
+so a crash or Termux stop never loses the sequence: post #127 sent, bot
+restarts → next post is #128, not #1.
+
+If the bot was offline through several scheduled intervals,
+`MISSED_SCHEDULE_POLICY=next` ensures it sends only the **next** post once
+it's back online — it never floods channels by dumping every missed post
+at once.
+
+## 17. Troubleshooting
+
+- **"Bad Request: can't parse entities"** — should never happen; every
+  dynamic value sent in an HTML-mode message is escaped with
+  `html.escape`. If you see this, please file an issue with the exact
+  command used.
+- **Source/destination shows "⚠️ Unavailable"** — the bot lost admin
+  rights, was removed, or the channel was deleted. Re-add the bot as
+  admin, then use `/reload`.
+- **`pydantic-core` build errors on Termux** — make sure you're using the
+  `requirements.txt` from this repo; it's pinned to versions with
+  prebuilt wheels and avoids forcing a source build.
+- **Nothing gets posted** — check `/status`: you need at least one active
+  source with loaded posts (`/importposts` or auto-capture) *and* at
+  least one active destination, and the scheduler must be running
+  (`/startschedule`).
+
+## 18. Telegram Bot API history limitation
+
+A normal Bot API bot **cannot** fetch a channel's arbitrary old message
+history — there is no such method. This bot supports two ways to get
+content in:
+
+1. **Automatic capture** — while the bot is an admin in a source channel,
+   every *new* post is captured automatically.
+2. **`/importposts`** — for existing content, export the message IDs you
+   want (e.g. from your own records) into a JSON file and import them.
+
+## 19. Termux keep-alive instructions
+
+Termux may kill background processes to save battery. To keep the bot
+alive:
+
+```bash
+termux-wake-lock
+```
+
+Also disable battery optimization for Termux in Android settings, and
+consider running the bot inside `tmux` so it survives Termux app restarts:
+
 ```bash
 pkg install tmux
-tmux new -s videobot
+tmux new -s forwarder
 python bot.py
-# detach: Ctrl+B then D
+# detach with Ctrl+B then D; reattach later with: tmux attach -t forwarder
 ```
-Reattach any time with:
-```bash
-tmux attach -t videobot
-```
-Also consider `termux-wake-lock` to stop Android from killing Termux, and
-disabling battery optimization for Termux in Android settings.
 
-## 16. Running on a VPS / Koyeb / Render / Railway
+## 20. Security
 
-Any host that can run `python bot.py` as a long-lived process works —
-this is a plain polling bot with no web server, so no port needs to be
-exposed. Use each platform's "worker" / "background process" service type
-(not a web service), set the environment variables from `.env.example` in
-the platform's dashboard, and set the start command to `python bot.py`.
+- `BOT_TOKEN` and `OWNER_ID` are read only from environment variables —
+  never hardcoded, never logged.
+- Only `OWNER_ID` can manage sources, destinations, imports, and the
+  scheduler. Everyone else can only use `/start`, `/help`, `/status`,
+  `/next`.
+- This bot only distributes content from channels its owner already
+  administers — it does not attempt to bypass Telegram's permission model
+  or access private channels it hasn't been added to.
 
 ---
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Bot exits immediately with `[CONFIG ERROR]` | Missing/invalid `.env` value | Check the exact variable named in the error |
-| "BOT_TOKEN is invalid" | Wrong/revoked token | Get a fresh token from @BotFather |
-| "Cannot access SOURCE_CHANNEL_ID" | Bot not added to channel, or wrong ID | Re-check step 3 and re-add the bot |
-| "Bot is not an administrator in source channel" | Bot added but not promoted | Promote it to admin |
-| `/addchannel` says it can't verify the channel | Bot not admin there yet | Add & promote it, then retry |
-| Videos not appearing in `/status` count | Nothing captured yet and nothing imported | See section 7 |
-| A destination channel keeps failing | Bot lost admin, or was removed | Check `/channels` and re-add/re-promote |
-| Duplicate video sent after a crash | Should not happen — file a bug | Check `bot.log` for the exact index/channel involved |
-
-## Telegram API limitations (summary)
-
-- Bots cannot browse arbitrary old channel history — see section 7.
-- `forwardMessage` shows "Forwarded from ..."; this bot always uses
-  `copyMessage` instead, which sends a clean copy with no source
-  attribution, per the requirement.
-- Flood limits (`RetryAfter`) are respected automatically: the bot waits the
-  exact duration Telegram requests before retrying, per channel.
-- Bot API rate limits mean very large numbers of destination channels will
-  naturally take a few seconds longer per cycle; the scheduler accounts for
-  this by scheduling the *next* run from a fixed grid, not from "whenever
-  the last send finished," so a slow cycle doesn't cause creeping drift
-  across days/weeks.
 
 ## Project structure
 
 ```
-telegram_video_bot/
-├── bot.py           # entry point: startup checks, polling, shutdown
-├── config.py        # env var loading & validation
-├── scheduler.py      # drift-free 30-min loop, retries, duplicate-safe delivery
-├── storage.py        # atomic JSON persistence (videos/channels/schedule)
-├── handlers.py       # all commands + source channel capture
-├── utils.py           # logging + atomic JSON read/write helpers
+Forwarder-ROBOT/
+├── bot.py              entry point / startup sequence
+├── config.py            .env loading & validation
+├── handlers.py           all command handlers + auto-capture
+├── scheduler.py          distribution loop, queue building, resume logic
+├── storage.py            atomic JSON persistence
+├── telegram_utils.py      escaping, verification, retrying copy calls
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
 ├── README.md
 └── data/
-    ├── videos.json     # source video message_id sequence
-    ├── channels.json   # destination channel IDs
-    └── schedule.json   # current index, next run time, delivery tracking
+    ├── sources.json
+    ├── channels.json
+    ├── posts.json
+    ├── schedule.json
+    └── settings.json
 ```
