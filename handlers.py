@@ -865,22 +865,17 @@ async def cmd_importposts(message: Message, bot: Bot) -> None:
 
 def register_handlers(dp, bot: Bot, scheduler) -> None:
     """
-    Register all handlers on the dispatcher.
+    Register handlers exactly once.
 
-    We pass scheduler/bot through handler closure so handlers can
-    access them without global variables.
+    Important:
+    aiogram Router can only be attached to one Dispatcher once.
     """
 
-    # Remove previously attached handlers if possible.
-    dp.include_router(router)
+    # Prevent:
+    # RuntimeError: Router is already attached to <Dispatcher ...>
+    if router.parent_router is None:
+        dp.include_router(router)
 
-    # NOTE:
-    # The scheduler argument is injected by wrapping specific handlers
-    # through dispatcher data in bot.py / middleware in a normal setup.
-    #
-    # To keep compatibility with your current bot.py, expose objects
-    # through router workflow below.
-
-    # Store references for compatibility.
-    router["bot"] = bot
-    router["scheduler"] = scheduler
+    # Store dependencies in Dispatcher workflow data.
+    dp["bot_instance"] = bot
+    dp["scheduler_instance"] = scheduler
