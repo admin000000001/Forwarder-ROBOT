@@ -1,14 +1,32 @@
+"""
+telegram_utils.py
+
+Telegram helper functions for Forwarder-ROBOT.
+
+Supports:
+- HTML escaping
+- Telegram chat verification
+- Single message copying
+- Media-group / album copying
+- Retry handling
+- Network error handling
+- Telegram rate-limit handling
+
+Compatible with aiogram 3.x.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 from dataclasses import dataclass
-from html import escape as _html_escape
-from typing import Awaitable, Callable, TypeVar
+from html import escape as html_escape
+from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import (
     TelegramBadRequest,
+    TelegramForbiddenError,
     TelegramNetworkError,
     TelegramRetryAfter,
     TelegramServerError,
@@ -16,25 +34,27 @@ from aiogram.exceptions import (
 
 logger = logging.getLogger("forwarder")
 
-T = TypeVar("T")
-
 
 # ============================================================
-# HTML SAFETY
+# HTML ESCAPE
 # ============================================================
 
-def esc(value: object) -> str:
+def esc(value: Any) -> str:
     """
-    Safely escape dynamic text for Telegram HTML parse mode.
+    Escape dynamic values before putting them inside
+    Telegram HTML messages.
 
-    Prevents errors such as:
-        Bad Request: can't parse entities:
-        Unsupported start tag "id"
+    Example:
+        esc("<test>")
+
+    becomes:
+        &lt;test&gt;
     """
-    if value is None:
-        return ""
 
-    return _html_escape(str(value), quote=False)
+    return html_escape(
+        str(value),
+        quote=False,
+    )
 
 
 # ============================================================
@@ -44,6 +64,7 @@ def esc(value: object) -> str:
 @dataclass
 class ChatAccessResult:
     ok: bool
+    chat_id: int
     title: str | None = None
     username: str | None = None
     error: str | None = None
@@ -51,46 +72,68 @@ class ChatAccessResult:
 
 async def verify_chat_access(
     bot: Bot,
-    chat_id: int,
+    chat_id: int | str,
 ) -> ChatAccessResult:
     """
-    Check whether the bot can access a Telegram chat/channel.
+    Verify that the bot can access a Telegram chat/channel.
+
+    The bot should normally be an administrator in source
+    and destination channels.
     """
 
     try:
-        chat = await bot.get_chat(chat_id)
+        chat = await bot.get_chat(
+            chat_id=int(chat_id)
+        )
 
         title = (
             getattr(chat, "title", None)
             or getattr(chat, "first_name", None)
             or getattr(chat, "username", None)
-            or str(chat_id)
         )
 
-        username = getattr(chat, "username", None)
+        username = getattr(
+            chat,
+            "username",
+            None,
+        )
 
         return ChatAccessResult(
             ok=True,
+            chat_id=int(chat.id),
             title=title,
             username=username,
-            error=None,
+        )
+
+    except TelegramForbiddenError as exc:
+
+        return ChatAccessResult(
+            ok=False,
+            chat_id=int(chat_id),
+            error=f"Forbidden: {exc}",
         )
 
     except TelegramBadRequest as exc:
+
         return ChatAccessResult(
             ok=False,
+            chat_id=int(chat_id),
             error=str(exc),
         )
 
     except TelegramNetworkError as exc:
+
         return ChatAccessResult(
             ok=False,
+            chat_id=int(chat_id),
             error=f"Network error: {exc}",
         )
 
     except Exception as exc:
+
         return ChatAccessResult(
             ok=False,
+            chat_id=int(chat_id),
             error=str(exc),
         )
 
@@ -99,93 +142,29 @@ async def verify_chat_access(
 # RETRY HELPER
 # ============================================================
 
-async def _run_with_retry(
-    operation: Callable[[], Awaitable[T]],
-    *,
-    retries: int = 3,
-    backoff_seconds: int = 5,
-) -> T:
+async def _retry_sleep(
+    attempt: int,
+    retry_after: int | float | None = None,
+) -> None:
 
-    last_error: Exception | None = None
+    if retry_after is not None:
 
-    retries = max(1, int(retries))
+        delay = float(retry_after) + 1.0
 
-    for attempt in range(1, retries + 1):
+    else:
 
-        try:
-            return await operation()
+        # 2, 4, 8, 16...
+        delay = min(
+            2 ** attempt,
+            30,
+        )
 
-        except TelegramRetryAfter as exc:
-            last_error = exc
+    logger.warning(
+        "[WARNING] Telegram request retrying in %.1fs",
+        delay,
+    )
 
-            retry_after = int(getattr(exc, "retry_after", 5))
-
-            if attempt >= retries:
-                break
-
-            logger.warning(
-                "[WARNING] Telegram rate limit. "
-                "Retrying in %s seconds (attempt %s/%s)",
-                retry_after,
-                attempt,
-                retries,
-            )
-
-            await asyncio.sleep(retry_after)
-
-        except (
-            TelegramNetworkError,
-            TelegramServerError,
-            TimeoutError,
-            asyncio.TimeoutError,
-        ) as exc:
-
-            last_error = exc
-
-            if attempt >= retries:
-                break
-
-            delay = backoff_seconds * attempt
-
-            logger.warning(
-                "[WARNING] Telegram request failed: %s. "
-                "Retrying in %s seconds (attempt %s/%s)",
-                exc,
-                delay,
-                attempt,
-                retries,
-            )
-
-            await asyncio.sleep(delay)
-
-        except TelegramBadRequest:
-            # BadRequest normally means the request itself is invalid.
-            # Retrying will not fix wrong chat/message IDs.
-            raise
-
-        except Exception as exc:
-            last_error = exc
-
-            if attempt >= retries:
-                break
-
-            delay = backoff_seconds * attempt
-
-            logger.warning(
-                "[WARNING] Unexpected Telegram error: %s. "
-                "Retrying in %s seconds (attempt %s/%s)",
-                exc,
-                delay,
-                attempt,
-                retries,
-            )
-
-            await asyncio.sleep(delay)
-
-    if last_error is not None:
-        raise last_error
-
-    raise RuntimeError("Telegram operation failed")
+    await asyncio.sleep(delay)
 
 
 # ============================================================
@@ -197,54 +176,95 @@ async def copy_message_with_retry(
     destination_chat_id: int,
     source_chat_id: int,
     message_id: int,
-    retries: int = 3,
+    *,
+    max_retries: int = 5,
 ) -> tuple[bool, str | None]:
     """
     Copy one Telegram message.
 
-    Works for supported Telegram message types, including:
-      - video
-      - photo
-      - document
-      - audio
-      - voice
-      - animation
-      - text
-      - captioned media
-      - stickers
-      - other Bot API copyable messages
+    Preserves Telegram's original message content including:
+    - text
+    - photo
+    - video
+    - document
+    - audio
+    - animation
+    - caption
+    - formatting
+    - spoilers
+    - etc.
 
-    Telegram's copyMessage keeps the original content/caption
-    without creating a forward header.
+    Returns:
+        (True, None) on success
+        (False, error) on failure
     """
 
-    async def operation() -> tuple[bool, str | None]:
-        await bot.copy_message(
-            chat_id=destination_chat_id,
-            from_chat_id=source_chat_id,
-            message_id=message_id,
-        )
+    for attempt in range(max_retries + 1):
 
-        return True, None
+        try:
 
-    try:
-        return await _run_with_retry(
-            operation,
-            retries=retries,
-            backoff_seconds=5,
-        )
+            await bot.copy_message(
+                chat_id=int(destination_chat_id),
+                from_chat_id=int(source_chat_id),
+                message_id=int(message_id),
+            )
 
-    except Exception as exc:
-        logger.error(
-            "[ERROR] copy_message failed "
-            "(source=%s, message=%s, destination=%s): %s",
-            source_chat_id,
-            message_id,
-            destination_chat_id,
-            exc,
-        )
+            return True, None
 
-        return False, str(exc)
+        except TelegramRetryAfter as exc:
+
+            if attempt >= max_retries:
+
+                return (
+                    False,
+                    f"Flood limit: retry after {exc.retry_after}s",
+                )
+
+            await _retry_sleep(
+                attempt,
+                exc.retry_after,
+            )
+
+        except (
+            TelegramNetworkError,
+            TelegramServerError,
+        ) as exc:
+
+            if attempt >= max_retries:
+
+                return (
+                    False,
+                    f"Network/server error: {exc}",
+                )
+
+            await _retry_sleep(attempt)
+
+        except TelegramForbiddenError as exc:
+
+            return (
+                False,
+                f"Forbidden: {exc}",
+            )
+
+        except TelegramBadRequest as exc:
+
+            return (
+                False,
+                f"Telegram BadRequest: {exc}",
+            )
+
+        except Exception as exc:
+
+            if attempt >= max_retries:
+
+                return (
+                    False,
+                    str(exc),
+                )
+
+            await _retry_sleep(attempt)
+
+    return False, "Unknown copy error"
 
 
 # ============================================================
@@ -256,116 +276,230 @@ async def copy_media_group_with_retry(
     destination_chat_id: int,
     source_chat_id: int,
     message_ids: list[int],
-    retries: int = 3,
+    *,
+    max_retries: int = 5,
 ) -> tuple[bool, str | None]:
     """
     Copy an album/media group.
 
-    The Telegram Bot API does not expose a copyMediaGroup method.
-    Therefore each message is copied individually in the original
-    message-ID order.
+    message_ids should contain all messages belonging to
+    the same Telegram media group.
 
-    This preserves the individual media and captions.
+    Example:
+        [100, 101, 102]
+
+    Telegram will preserve the media group structure.
     """
 
     if not message_ids:
-        return False, "Media group contains no message IDs."
 
-    async def operation() -> tuple[bool, str | None]:
-
-        for message_id in message_ids:
-
-            await bot.copy_message(
-                chat_id=destination_chat_id,
-                from_chat_id=source_chat_id,
-                message_id=message_id,
-            )
-
-        return True, None
-
-    try:
-        return await _run_with_retry(
-            operation,
-            retries=retries,
-            backoff_seconds=5,
-        )
-
-    except Exception as exc:
-        logger.error(
-            "[ERROR] copy_media_group failed "
-            "(source=%s, messages=%s, destination=%s): %s",
-            source_chat_id,
-            message_ids,
-            destination_chat_id,
-            exc,
-        )
-
-        return False, str(exc)
-
-
-# ============================================================
-# OPTIONAL: COPY MULTIPLE MESSAGES
-# ============================================================
-
-async def copy_messages_with_retry(
-    bot: Bot,
-    destination_chat_id: int,
-    source_chat_id: int,
-    message_ids: list[int],
-    retries: int = 3,
-) -> tuple[bool, str | None]:
-    """
-    Copy multiple messages sequentially.
-
-    Useful for posts that contain several related messages.
-    """
-
-    if not message_ids:
         return False, "No message IDs supplied."
 
-    async def operation() -> tuple[bool, str | None]:
+    # Telegram allows copyMessages with a list of message IDs.
+    # Keep IDs unique and preserve their original order.
 
-        for message_id in message_ids:
+    clean_ids: list[int] = []
 
-            await bot.copy_message(
-                chat_id=destination_chat_id,
-                from_chat_id=source_chat_id,
-                message_id=message_id,
+    seen: set[int] = set()
+
+    for message_id in message_ids:
+
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            continue
+
+        if mid in seen:
+            continue
+
+        seen.add(mid)
+        clean_ids.append(mid)
+
+    if not clean_ids:
+
+        return False, "No valid message IDs supplied."
+
+    for attempt in range(max_retries + 1):
+
+        try:
+
+            await bot.copy_messages(
+                chat_id=int(destination_chat_id),
+                from_chat_id=int(source_chat_id),
+                message_ids=clean_ids,
             )
 
-        return True, None
+            return True, None
+
+        except TelegramRetryAfter as exc:
+
+            if attempt >= max_retries:
+
+                return (
+                    False,
+                    f"Flood limit: retry after {exc.retry_after}s",
+                )
+
+            await _retry_sleep(
+                attempt,
+                exc.retry_after,
+            )
+
+        except (
+            TelegramNetworkError,
+            TelegramServerError,
+        ) as exc:
+
+            if attempt >= max_retries:
+
+                return (
+                    False,
+                    f"Network/server error: {exc}",
+                )
+
+            await _retry_sleep(attempt)
+
+        except TelegramForbiddenError as exc:
+
+            return (
+                False,
+                f"Forbidden: {exc}",
+            )
+
+        except TelegramBadRequest as exc:
+
+            return (
+                False,
+                f"Telegram BadRequest: {exc}",
+            )
+
+        except Exception as exc:
+
+            if attempt >= max_retries:
+
+                return (
+                    False,
+                    str(exc),
+                )
+
+            await _retry_sleep(attempt)
+
+    return False, "Unknown media-group copy error"
+
+
+# ============================================================
+# GENERIC COPY HELPER
+# ============================================================
+
+async def copy_post_with_retry(
+    bot: Bot,
+    destination_chat_id: int,
+    post: dict[str, Any],
+    *,
+    max_retries: int = 5,
+) -> tuple[bool, str | None]:
+    """
+    Generic helper.
+
+    Automatically detects whether the stored post is:
+    - a single message
+    - an album/media group
+    """
 
     try:
-        return await _run_with_retry(
-            operation,
-            retries=retries,
-            backoff_seconds=5,
+
+        source_chat_id = int(
+            post["source_chat_id"]
         )
 
-    except Exception as exc:
-        logger.error(
-            "[ERROR] copy_messages failed "
-            "(source=%s, messages=%s, destination=%s): %s",
+        message_ids = [
+            int(x)
+            for x in post.get(
+                "message_ids",
+                [],
+            )
+        ]
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+
+        return False, f"Invalid post data: {exc}"
+
+    if not message_ids:
+
+        return False, "Post contains no message IDs."
+
+    is_album = (
+        post.get("type") == "album"
+        and len(message_ids) > 1
+    )
+
+    if is_album:
+
+        return await copy_media_group_with_retry(
+            bot,
+            destination_chat_id,
             source_chat_id,
             message_ids,
-            destination_chat_id,
-            exc,
+            max_retries=max_retries,
         )
+
+    return await copy_message_with_retry(
+        bot,
+        destination_chat_id,
+        source_chat_id,
+        message_ids[0],
+        max_retries=max_retries,
+    )
+
+
+# ============================================================
+# OPTIONAL: BOT ADMIN CHECK
+# ============================================================
+
+async def check_bot_admin(
+    bot: Bot,
+    chat_id: int,
+) -> tuple[bool, str | None]:
+
+    try:
+
+        me = await bot.get_me()
+
+        member = await bot.get_chat_member(
+            chat_id=int(chat_id),
+            user_id=int(me.id),
+        )
+
+        status = str(member.status)
+
+        if status in {
+            "administrator",
+            "creator",
+        }:
+
+            return True, None
+
+        return (
+            False,
+            f"Bot is not admin. Current status: {status}",
+        )
+
+    except TelegramBadRequest as exc:
 
         return False, str(exc)
 
+    except TelegramForbiddenError as exc:
 
-# ============================================================
-# TEST HELPERS
-# ============================================================
+        return False, str(exc)
 
-async def test_chat_access(
-    bot: Bot,
-    chat_id: int,
-) -> bool:
-    """
-    Simple boolean access test.
-    """
+    except TelegramNetworkError as exc:
 
-    result = await verify_chat_access(bot, chat_id)
-    return result.ok
+        return False, str(exc)
+
+    except Exception as exc:
+
+        return False, str(exc)
