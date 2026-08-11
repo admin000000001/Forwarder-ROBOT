@@ -1,128 +1,171 @@
 """
 storage.py
 
-All persistent JSON state lives here:
-  - videos.json    : the ordered list of source video message IDs
-  - channels.json  : destination channel IDs
-  - schedule.json  : scheduler position, timing, and in-progress delivery
-                      tracking (used to prevent duplicate sends on restart)
-
-Every read/write goes through utils.read_json / utils.write_json, which are
-atomic and lock-protected, so concurrent access from commands + the
-scheduler loop can never corrupt state or race.
+JSON-file persistence layer. No external databases are used.
+All writes are atomic (write to temp file, flush, fsync, then os.replace)
+so a crash mid-write never corrupts the on-disk JSON.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import tempfile
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
-from config import CONFIG, VIDEOS_FILE, CHANNELS_FILE, SCHEDULE_FILE
-from utils import read_json, write_json, log
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-DEFAULT_VIDEOS: dict[str, Any] = {
-    "source_channel_id": CONFIG.source_channel_id,
-    "videos": [],
+SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
+CHANNELS_FILE = os.path.join(DATA_DIR, "channels.json")
+POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
+SCHEDULE_FILE = os.path.join(DATA_DIR, "schedule.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+
+_DEFAULTS: dict[str, dict[str, Any]] = {
+    SOURCES_FILE: {"sources": []},
+    CHANNELS_FILE: {"channels": []},
+    POSTS_FILE: {"posts": []},
+    SCHEDULE_FILE: {
+        "current_index": 0,
+        "running": False,
+        "next_run_iso": None,
+        "last_completed_iso": None,
+    },
+    SETTINGS_FILE: {
+        "interval_minutes": None,  # None => fall back to CONFIG default
+        "source_mode": None,
+        "missed_schedule_policy": None,
+        "auto_queue_new_posts": None,
+        "total_posts": None,
+    },
 }
 
-DEFAULT_CHANNELS: dict[str, Any] = {
-    "channels": [],
-}
+# A single global lock per process is sufficient here: the bot is a single
+# asyncio process and JSON files are small, so serializing writes avoids
+# any read/modify/write race between concurrent handlers.
+_LOCK = asyncio.Lock()
 
-DEFAULT_SCHEDULE: dict[str, Any] = {
-    "current_index": 0,       # 0-based index into videos.json["videos"]
-    "cycle": 1,                # how many full 1440-video loops completed
-    "next_run": None,          # ISO 8601 timestamp of the next scheduled send
-    "running": False,          # whether the scheduler should be active
-    "in_progress_index": None,  # index currently being delivered (crash marker)
-    "delivered_channels": [],   # channels already delivered for in_progress_index
-    "last_completed_index": None,
-    "last_run_at": None,
-}
+
+def _ensure_data_dir() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _atomic_write(path: str, data: dict[str, Any]) -> None:
+    _ensure_data_dir()
+    directory = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def _read_raw(path: str) -> dict[str, Any]:
+    _ensure_data_dir()
+    if not os.path.exists(path):
+        default = _DEFAULTS[path]
+        _atomic_write(path, default)
+        return json.loads(json.dumps(default))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            raise ValueError("empty file")
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError("root JSON element must be an object")
+        return data
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Malformed JSON must never crash the bot. Reset to a safe default
+        # and keep a .corrupt backup for manual inspection.
+        print(f"[WARNING] {path} is corrupt ({exc}); resetting to default.")
+        try:
+            backup_path = path + ".corrupt"
+            if os.path.exists(path):
+                os.replace(path, backup_path)
+        except OSError:
+            pass
+        default = _DEFAULTS[path]
+        _atomic_write(path, default)
+        return json.loads(json.dumps(default))
+
+
+async def read_json(path: str) -> dict[str, Any]:
+    async with _LOCK:
+        return await asyncio.to_thread(_read_raw, path)
+
+
+async def write_json(path: str, data: dict[str, Any]) -> None:
+    async with _LOCK:
+        await asyncio.to_thread(_atomic_write, path, data)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def new_uid() -> str:
+    return uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------------------
-# videos.json
+# Typed convenience helpers
 # ---------------------------------------------------------------------------
 
-async def get_videos() -> dict[str, Any]:
-    data = await read_json(VIDEOS_FILE, DEFAULT_VIDEOS)
-    if "videos" not in data or not isinstance(data["videos"], list):
-        log.warning("videos.json malformed; resetting to empty list")
-        data = dict(DEFAULT_VIDEOS)
-    return data
+
+async def get_sources() -> list[dict[str, Any]]:
+    data = await read_json(SOURCES_FILE)
+    return data.get("sources", [])
 
 
-async def save_videos(data: dict[str, Any]) -> None:
-    await write_json(VIDEOS_FILE, data)
+async def save_sources(sources: list[dict[str, Any]]) -> None:
+    await write_json(SOURCES_FILE, {"sources": sources})
 
 
-async def add_video_id(message_id: int) -> bool:
-    """Append a message_id if not already present. Returns True if added."""
-    data = await get_videos()
-    if message_id in data["videos"]:
-        return False
-    data["videos"].append(message_id)
-    await save_videos(data)
-    return True
+async def get_channels() -> list[dict[str, Any]]:
+    data = await read_json(CHANNELS_FILE)
+    return data.get("channels", [])
 
 
-async def import_video_ids(ids: list[int]) -> int:
-    """Replace/merge the video ID list from an owner-provided import."""
-    data = await get_videos()
-    existing = set(data["videos"])
-    added = 0
-    for vid in ids:
-        if not isinstance(vid, int):
-            continue
-        if vid not in existing:
-            data["videos"].append(vid)
-            existing.add(vid)
-            added += 1
-    await save_videos(data)
-    return added
-
-
-# ---------------------------------------------------------------------------
-# channels.json
-# ---------------------------------------------------------------------------
-
-async def get_channels() -> list[int]:
-    data = await read_json(CHANNELS_FILE, DEFAULT_CHANNELS)
-    channels = data.get("channels", [])
-    if not isinstance(channels, list):
-        log.warning("channels.json malformed; resetting to empty list")
-        return []
-    return channels
-
-
-async def add_channel(channel_id: int) -> bool:
-    channels = await get_channels()
-    if channel_id in channels:
-        return False
-    channels.append(channel_id)
+async def save_channels(channels: list[dict[str, Any]]) -> None:
     await write_json(CHANNELS_FILE, {"channels": channels})
-    return True
 
 
-async def remove_channel(channel_id: int) -> bool:
-    channels = await get_channels()
-    if channel_id not in channels:
-        return False
-    channels.remove(channel_id)
-    await write_json(CHANNELS_FILE, {"channels": channels})
-    return True
+async def get_posts() -> list[dict[str, Any]]:
+    data = await read_json(POSTS_FILE)
+    return data.get("posts", [])
 
 
-# ---------------------------------------------------------------------------
-# schedule.json
-# ---------------------------------------------------------------------------
+async def save_posts(posts: list[dict[str, Any]]) -> None:
+    await write_json(POSTS_FILE, {"posts": posts})
+
 
 async def get_schedule() -> dict[str, Any]:
-    data = await read_json(SCHEDULE_FILE, DEFAULT_SCHEDULE)
-    merged = dict(DEFAULT_SCHEDULE)
+    data = await read_json(SCHEDULE_FILE)
+    merged = json.loads(json.dumps(_DEFAULTS[SCHEDULE_FILE]))
     merged.update(data)
     return merged
 
 
-async def save_schedule(data: dict[str, Any]) -> None:
-    await write_json(SCHEDULE_FILE, data)
+async def save_schedule(schedule: dict[str, Any]) -> None:
+    await write_json(SCHEDULE_FILE, schedule)
+
+
+async def get_settings() -> dict[str, Any]:
+    data = await read_json(SETTINGS_FILE)
+    merged = json.loads(json.dumps(_DEFAULTS[SETTINGS_FILE]))
+    merged.update(data)
+    return merged
+
+
+async def save_settings(settings: dict[str, Any]) -> None:
+    await write_json(SETTINGS_FILE, settings)
