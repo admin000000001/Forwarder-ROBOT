@@ -1,329 +1,594 @@
 """
 handlers.py
 
-All Telegram command handlers, plus the channel_post listener that captures
-new video message IDs from the source channel as they arrive (the only
-Bot-API-legal way to build the sequence going forward -- see README for the
-historical-backfill limitation).
+All Telegram command handlers and the automatic new-post capture handler.
+Owner-only commands verify message.from_user.id == CONFIG.owner_id.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
+from functools import wraps
+from typing import Any, Callable
 
-from aiogram import Router, F, Bot
-from aiogram.filters import Command, CommandObject
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
 from aiogram.types import Message
 
 import storage
 from config import CONFIG
-from utils import log
+from scheduler import Scheduler
+from telegram_utils import esc, verify_chat_access
 
-router = Router()
+logger = logging.getLogger("forwarder")
 
-# Filled in by bot.py after the scheduler is constructed, so handlers can
-# call scheduler.enable() / disable() / reset() without a circular import.
-scheduler = None
-
-
-def bind_scheduler(sched) -> None:
-    global scheduler
-    scheduler = sched
+router_scheduler: Scheduler | None = None
 
 
-def is_owner(message: Message) -> bool:
-    return message.from_user is not None and message.from_user.id == CONFIG.owner_id
+def set_scheduler(scheduler: Scheduler) -> None:
+    global router_scheduler
+    router_scheduler = scheduler
 
 
-async def deny(message: Message) -> None:
-    await message.reply("You are not authorized to use this command.")
+def owner_only(handler: Callable) -> Callable:
+    @wraps(handler)
+    async def wrapper(message: Message, *args: Any, **kwargs: Any) -> Any:
+        if message.from_user is None or message.from_user.id != CONFIG.owner_id:
+            await message.answer("⛔ This command is restricted to the bot owner.")
+            return None
+        return await handler(message, *args, **kwargs)
+
+    return wrapper
 
 
-# ---------------------------------------------------------------------------
-# Basic commands
-# ---------------------------------------------------------------------------
-
-@router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
-    await message.reply(
-        "🤖 Telegram Video Auto Distributor Bot\n\n"
-        "I copy one video from the source channel to all configured "
-        "destination channels every "
-        f"{CONFIG.interval_minutes} minutes, on an endless {CONFIG.total_videos}-video cycle.\n\n"
-        "Send /help to see available commands."
-    )
-
-
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    text = (
-        "📋 Commands\n\n"
-        "/status - show current bot & scheduler status\n"
-        "/next - show which video is up next\n"
-    )
-    if is_owner(message):
-        text += (
-            "\nOwner-only:\n"
-            "/addchannel <id> - add a destination channel\n"
-            "/removechannel <id> - remove a destination channel\n"
-            "/channels - list destination channels\n"
-            "/scan - explain/prepare source video collection\n"
-            "/importvideos - reply to a videos.json attachment to import IDs\n"
-            "/startschedule - start automatic scheduling\n"
-            "/stopschedule - stop scheduling (progress kept)\n"
-            "/reset - reset the sequence back to video #1 (confirmation required)\n"
-            "/reload - reload state from disk\n"
-        )
-    await message.reply(text)
-
-
-# ---------------------------------------------------------------------------
-# Status / next
-# ---------------------------------------------------------------------------
-
-@router.message(Command("status"))
-async def cmd_status(message: Message) -> None:
-    snap = await scheduler.status_snapshot()
-    sch = snap["schedule"]
-    current_video = sch["current_index"] + 1
-    next_run = sch.get("next_run")
-    next_run_str = "not scheduled"
-    if next_run:
-        try:
-            dt = datetime.fromisoformat(next_run)
-            next_run_str = dt.strftime("%Y-%m-%d %H:%M UTC")
-        except ValueError:
-            next_run_str = next_run
-
-    text = (
-        "🤖 Bot Status: ONLINE\n\n"
-        f"📦 Total Videos: {snap['total_videos']}\n"
-        f"▶️ Current Video: {current_video}/{snap['total_videos'] or CONFIG.total_videos}\n"
-        f"🔁 Cycle: {sch.get('cycle', 1)}\n"
-        f"📢 Destination Channels: {snap['total_channels']}\n"
-        f"⏰ Interval: {CONFIG.interval_minutes} minutes\n"
-        f"🕐 Next Video: {next_run_str}\n"
-        f"⚙️ Scheduler: {'RUNNING' if sch.get('running') else 'STOPPED'}"
-    )
-    await message.reply(text)
-
-
-@router.message(Command("next"))
-async def cmd_next(message: Message) -> None:
-    videos_data = await storage.get_videos()
-    videos = videos_data.get("videos", [])
-    schedule = await storage.get_schedule()
-    idx = schedule["current_index"]
-    if not videos:
-        await message.reply("No videos loaded yet. Use /scan for instructions.")
-        return
-    if idx >= len(videos):
-        idx = 0
-    await message.reply(
-        f"Next up: video #{idx + 1}/{len(videos)} (source message_id={videos[idx]})"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Channel management (owner only)
-# ---------------------------------------------------------------------------
-
-@router.message(Command("addchannel"))
-async def cmd_addchannel(message: Message, command: CommandObject, bot: Bot) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    if not command.args:
-        await message.reply("Usage: /addchannel -1001234567890")
-        return
+def _parse_chat_id_arg(text: str) -> int | None:
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
     try:
-        channel_id = int(command.args.strip().split()[0])
+        return int(parts[1].strip())
     except ValueError:
-        await message.reply("Invalid channel ID. It should look like -1001234567890.")
-        return
+        return None
 
-    try:
-        chat = await bot.get_chat(channel_id)
-        member = await bot.get_chat_member(channel_id, (await bot.get_me()).id)
-        if member.status not in ("administrator", "creator"):
-            await message.reply(
-                f"I can see '{chat.title}' but I'm not an admin there yet. "
-                "Please make me an admin, then try again."
+
+def register_handlers(dp: Dispatcher, bot: Bot, scheduler: Scheduler) -> None:
+    set_scheduler(scheduler)
+
+    # -- basic commands ---------------------------------------------------
+
+    @dp.message(Command("start"))
+    async def cmd_start(message: Message) -> None:
+        await message.answer(
+            "🤖 <b>Forwarder-ROBOT</b>\n\n"
+            "I automatically distribute posts from source channels to "
+            "destination channels on a schedule.\n\n"
+            "Send /help to see available commands."
+        )
+
+    @dp.message(Command("help"))
+    async def cmd_help(message: Message) -> None:
+        is_owner = message.from_user is not None and message.from_user.id == CONFIG.owner_id
+        lines = [
+            "🤖 <b>Forwarder-ROBOT — Help</b>",
+            "",
+            "<b>Public commands</b>",
+            "/start — welcome message",
+            "/help — this message",
+            "/status — bot and scheduler status",
+            "/next — show the next scheduled post",
+        ]
+        if is_owner:
+            lines += [
+                "",
+                "<b>Source management</b>",
+                "/addsource &lt;chat_id&gt;",
+                "/removesource &lt;chat_id&gt;",
+                "/sources",
+                "/setsource &lt;chat_id&gt; (alias of addsource)",
+                "/clearsources",
+                "/sourceinfo &lt;chat_id&gt;",
+                "",
+                "<b>Destination management</b>",
+                "/addchannel &lt;chat_id&gt;",
+                "/removechannel &lt;chat_id&gt;",
+                "/channels",
+                "/clearchannels",
+                "/channelinfo &lt;chat_id&gt;",
+                "",
+                "<b>Posts</b>",
+                "/importposts (reply to a .json file)",
+                "/scan",
+                "",
+                "<b>Scheduler</b>",
+                "/startschedule",
+                "/stopschedule",
+                "/setinterval &lt;minutes&gt;",
+                "/setsourcemode round_robin|sequential",
+                "/reset",
+                "/reload",
+            ]
+        await message.answer("\n".join(lines))
+
+    # -- source management --------------------------------------------------
+
+    @dp.message(Command("addsource", "setsource"))
+    @owner_only
+    async def cmd_addsource(message: Message) -> None:
+        chat_id = _parse_chat_id_arg(message.text or "")
+        if chat_id is None:
+            await message.answer("Usage: <code>/addsource -1001234567890</code>")
+            return
+
+        result = await verify_chat_access(bot, chat_id)
+        if not result.ok:
+            await message.answer(
+                "❌ Cannot access this source channel.\n\n"
+                f"Reason: {esc(result.error)}\n\n"
+                "Possible reasons:\n"
+                "• Wrong channel ID\n"
+                "• Bot is not a member\n"
+                "• Bot is not an administrator\n"
+                "• Channel was deleted"
             )
             return
-    except Exception as e:
-        await message.reply(f"Could not verify that channel: {e}")
-        return
 
-    added = await storage.add_channel(channel_id)
-    if added:
-        await message.reply(f"✅ Added destination channel: {chat.title} ({channel_id})")
-    else:
-        await message.reply("That channel is already in the list.")
+        sources = await storage.get_sources()
+        if any(s["chat_id"] == chat_id for s in sources):
+            await message.answer("ℹ️ This source is already added.")
+            return
 
-
-@router.message(Command("removechannel"))
-async def cmd_removechannel(message: Message, command: CommandObject) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    if not command.args:
-        await message.reply("Usage: /removechannel -1001234567890")
-        return
-    try:
-        channel_id = int(command.args.strip().split()[0])
-    except ValueError:
-        await message.reply("Invalid channel ID.")
-        return
-
-    removed = await storage.remove_channel(channel_id)
-    if removed:
-        await message.reply(f"✅ Removed destination channel {channel_id}")
-    else:
-        await message.reply("That channel was not in the list.")
-
-
-@router.message(Command("channels"))
-async def cmd_channels(message: Message) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    channels = await storage.get_channels()
-    if not channels:
-        await message.reply("No destination channels configured yet. Use /addchannel.")
-        return
-    lines = "\n".join(f"- {c}" for c in channels)
-    await message.reply(f"📢 Destination channels ({len(channels)}):\n{lines}")
-
-
-# ---------------------------------------------------------------------------
-# Source video collection
-# ---------------------------------------------------------------------------
-
-@router.message(Command("scan"))
-async def cmd_scan(message: Message) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    videos_data = await storage.get_videos()
-    count = len(videos_data.get("videos", []))
-    await message.reply(
-        "ℹ️ Telegram Bot API limitation\n\n"
-        "A bot account cannot enumerate arbitrary old message history of a "
-        "channel -- the Bot API simply does not expose that method. I can only:\n\n"
-        "1) Capture new videos automatically as they're posted from now on "
-        "(already active, since I'm an admin in the source channel), and\n"
-        "2) Import an existing list of message IDs that you prepare "
-        "separately (e.g. with a Telegram Desktop export or a userbot "
-        "script you control), via /importvideos.\n\n"
-        f"Currently loaded: {count} video(s).\n\n"
-        "See README.md section 'Telegram API limitations' for the full "
-        "explanation and a step-by-step way to prepare the 1440-message list."
-    )
-
-
-@router.message(Command("importvideos"))
-async def cmd_importvideos(message: Message, bot: Bot) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-
-    target = message.reply_to_message
-    if not target or not target.document:
-        await message.reply(
-            "Reply to a JSON file (e.g. videos.json, format: "
-            '{"videos": [101, 102, 103]}) with /importvideos to import it.'
+        sources.append(
+            {
+                "chat_id": chat_id,
+                "title": result.title,
+                "username": result.username,
+                "enabled": True,
+            }
         )
-        return
+        await storage.save_sources(sources)
+        await message.answer(f"✅ Source added: {esc(result.title)} (<code>{chat_id}</code>)")
 
-    try:
-        file = await bot.get_file(target.document.file_id)
-        buf = await bot.download_file(file.file_path)
-        payload = json.loads(buf.read().decode("utf-8"))
-        ids = payload.get("videos", payload if isinstance(payload, list) else [])
-        ids = [int(x) for x in ids]
-    except Exception as e:
-        await message.reply(f"Could not parse that file as a video ID list: {e}")
-        return
+    @dp.message(Command("removesource"))
+    @owner_only
+    async def cmd_removesource(message: Message) -> None:
+        chat_id = _parse_chat_id_arg(message.text or "")
+        if chat_id is None:
+            await message.answer("Usage: <code>/removesource -1001234567890</code>")
+            return
+        sources = await storage.get_sources()
+        new_sources = [s for s in sources if s["chat_id"] != chat_id]
+        if len(new_sources) == len(sources):
+            await message.answer("ℹ️ That source was not found.")
+            return
+        await storage.save_sources(new_sources)
+        await message.answer(f"✅ Source removed: <code>{chat_id}</code>")
 
-    added = await storage.import_video_ids(ids)
-    videos_data = await storage.get_videos()
-    await message.reply(
-        f"✅ Imported {added} new video ID(s). "
-        f"Total now loaded: {len(videos_data['videos'])}."
-    )
+    @dp.message(Command("clearsources"))
+    @owner_only
+    async def cmd_clearsources(message: Message) -> None:
+        await storage.save_sources([])
+        await message.answer("✅ All sources cleared.")
 
+    @dp.message(Command("sources"))
+    @owner_only
+    async def cmd_sources(message: Message) -> None:
+        sources = await storage.get_sources()
+        if not sources:
+            await message.answer("📚 No sources configured. Use /addsource &lt;chat_id&gt;.")
+            return
+        lines = ["📚 <b>Sources</b>", ""]
+        for i, s in enumerate(sources, start=1):
+            status = "✅ Active" if s.get("enabled", True) else "⚠️ Unavailable"
+            lines.append(
+                f"{i}. {esc(s.get('title') or 'Unknown')}\n"
+                f"ID: <code>{s['chat_id']}</code>\n"
+                f"Status: {status}\n"
+            )
+        await message.answer("\n".join(lines))
 
-@router.channel_post(F.video | F.document)
-async def capture_channel_video(message: Message) -> None:
-    """Passively captures new video posts from the source channel, in order,
-    as Telegram delivers them -- this is the mechanism that keeps the
-    sequence growing correctly going forward."""
-    if message.chat.id != CONFIG.source_channel_id:
-        return
-    if not message.video:
-        return  # only true video messages count toward the 1440 sequence
-    added = await storage.add_video_id(message.message_id)
-    if added:
-        log.info(f"Captured new source video: message_id={message.message_id}")
-
-
-# ---------------------------------------------------------------------------
-# Scheduler control (owner only)
-# ---------------------------------------------------------------------------
-
-@router.message(Command("startschedule"))
-async def cmd_startschedule(message: Message) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    videos_data = await storage.get_videos()
-    channels = await storage.get_channels()
-    if not videos_data.get("videos"):
-        await message.reply("Cannot start: no videos loaded. Use /scan for instructions.")
-        return
-    if not channels:
-        await message.reply("Cannot start: no destination channels configured. Use /addchannel.")
-        return
-    await scheduler.enable()
-    await message.reply("▶️ Scheduler started.")
-
-
-@router.message(Command("stopschedule"))
-async def cmd_stopschedule(message: Message) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    await scheduler.disable()
-    await message.reply("⏸️ Scheduler stopped. Progress has been preserved.")
-
-
-@router.message(Command("reset"))
-async def cmd_reset(message: Message, command: CommandObject) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    if (command.args or "").strip().upper() != "YES":
-        await message.reply(
-            "⚠️ This will reset the video sequence to Video #1.\n\n"
-            "Are you sure? Send: /reset YES"
+    @dp.message(Command("sourceinfo"))
+    @owner_only
+    async def cmd_sourceinfo(message: Message) -> None:
+        chat_id = _parse_chat_id_arg(message.text or "")
+        if chat_id is None:
+            await message.answer("Usage: <code>/sourceinfo -1001234567890</code>")
+            return
+        sources = await storage.get_sources()
+        match = next((s for s in sources if s["chat_id"] == chat_id), None)
+        if not match:
+            await message.answer("ℹ️ That source is not configured.")
+            return
+        status = "✅ Active" if match.get("enabled", True) else "⚠️ Unavailable"
+        await message.answer(
+            f"📚 <b>{esc(match.get('title') or 'Unknown')}</b>\n"
+            f"ID: <code>{match['chat_id']}</code>\n"
+            f"Username: {esc(match.get('username') or 'N/A')}\n"
+            f"Status: {status}"
         )
-        return
-    await scheduler.reset()
-    await message.reply("🔄 Sequence has been reset to Video #1.")
 
+    # -- destination management ----------------------------------------
 
-@router.message(Command("reload"))
-async def cmd_reload(message: Message) -> None:
-    if not is_owner(message):
-        await deny(message)
-        return
-    # storage.py reads fresh from disk on every call, so "reload" is just a
-    # user-facing confirmation that state is not cached.
-    snap = await scheduler.status_snapshot()
-    await message.reply(
-        f"🔄 Reloaded from disk.\n"
-        f"Videos: {snap['total_videos']} | Channels: {snap['total_channels']} | "
-        f"Current index: {snap['schedule']['current_index']}"
-    )
+    @dp.message(Command("addchannel"))
+    @owner_only
+    async def cmd_addchannel(message: Message) -> None:
+        chat_id = _parse_chat_id_arg(message.text or "")
+        if chat_id is None:
+            await message.answer("Usage: <code>/addchannel -1001234567890</code>")
+            return
+
+        result = await verify_chat_access(bot, chat_id)
+        if not result.ok:
+            await message.answer(
+                "❌ Cannot access this destination channel.\n\n"
+                f"Reason: {esc(result.error)}\n\n"
+                "Possible reasons:\n"
+                "• Wrong channel ID\n"
+                "• Bot is not a member\n"
+                "• Bot is not an administrator\n"
+                "• Channel was deleted"
+            )
+            return
+
+        channels = await storage.get_channels()
+        if any(c["chat_id"] == chat_id for c in channels):
+            await message.answer("ℹ️ This destination is already added.")
+            return
+
+        channels.append(
+            {
+                "chat_id": chat_id,
+                "title": result.title,
+                "username": result.username,
+                "enabled": True,
+            }
+        )
+        await storage.save_channels(channels)
+        await message.answer(f"✅ Destination added: {esc(result.title)} (<code>{chat_id}</code>)")
+
+    @dp.message(Command("removechannel"))
+    @owner_only
+    async def cmd_removechannel(message: Message) -> None:
+        chat_id = _parse_chat_id_arg(message.text or "")
+        if chat_id is None:
+            await message.answer("Usage: <code>/removechannel -1001234567890</code>")
+            return
+        channels = await storage.get_channels()
+        new_channels = [c for c in channels if c["chat_id"] != chat_id]
+        if len(new_channels) == len(channels):
+            await message.answer("ℹ️ That destination was not found.")
+            return
+        await storage.save_channels(new_channels)
+        await message.answer(f"✅ Destination removed: <code>{chat_id}</code>")
+
+    @dp.message(Command("clearchannels"))
+    @owner_only
+    async def cmd_clearchannels(message: Message) -> None:
+        await storage.save_channels([])
+        await message.answer("✅ All destinations cleared.")
+
+    @dp.message(Command("channels"))
+    @owner_only
+    async def cmd_channels(message: Message) -> None:
+        channels = await storage.get_channels()
+        if not channels:
+            await message.answer("📡 No destinations configured. Use /addchannel &lt;chat_id&gt;.")
+            return
+        lines = ["📡 <b>Destination Channels</b>", ""]
+        for i, c in enumerate(channels, start=1):
+            status = "✅ Active" if c.get("enabled", True) else "⚠️ Unavailable"
+            lines.append(
+                f"{i}. {esc(c.get('title') or 'Unknown')}\n"
+                f"ID: <code>{c['chat_id']}</code>\n"
+                f"Status: {status}\n"
+            )
+        await message.answer("\n".join(lines))
+
+    @dp.message(Command("channelinfo"))
+    @owner_only
+    async def cmd_channelinfo(message: Message) -> None:
+        chat_id = _parse_chat_id_arg(message.text or "")
+        if chat_id is None:
+            await message.answer("Usage: <code>/channelinfo -1001234567890</code>")
+            return
+        channels = await storage.get_channels()
+        match = next((c for c in channels if c["chat_id"] == chat_id), None)
+        if not match:
+            await message.answer("ℹ️ That destination is not configured.")
+            return
+        status = "✅ Active" if match.get("enabled", True) else "⚠️ Unavailable"
+        await message.answer(
+            f"📡 <b>{esc(match.get('title') or 'Unknown')}</b>\n"
+            f"ID: <code>{match['chat_id']}</code>\n"
+            f"Username: {esc(match.get('username') or 'N/A')}\n"
+            f"Status: {status}"
+        )
+
+    # -- posts / import -----------------------------------------------------
+
+    @dp.message(Command("importposts"))
+    @owner_only
+    async def cmd_importposts(message: Message) -> None:
+        if not message.reply_to_message or not message.reply_to_message.document:
+            await message.answer(
+                "Usage: reply to a <code>.json</code> file with /importposts.\n\n"
+                "Expected format:\n"
+                "<code>[{\"source_chat_id\": -1001234567890, \"message_id\": 101}]</code>"
+            )
+            return
+
+        doc = message.reply_to_message.document
+        try:
+            file = await bot.get_file(doc.file_id)
+            file_bytes = await bot.download_file(file.file_path)
+            raw = file_bytes.read().decode("utf-8")
+            entries = json.loads(raw)
+            if not isinstance(entries, list):
+                raise ValueError("Root JSON element must be a list")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ Failed to read/parse JSON file: {esc(exc)}")
+            return
+
+        sources = await storage.get_sources()
+        known_source_ids = {s["chat_id"] for s in sources}
+        posts = await storage.get_posts()
+        existing_pairs = {
+            (p["source_chat_id"], mid) for p in posts for mid in p["message_ids"]
+        }
+
+        imported = 0
+        skipped_invalid = 0
+        skipped_unknown_source = 0
+        skipped_duplicate = 0
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                skipped_invalid += 1
+                continue
+            source_chat_id = entry.get("source_chat_id")
+            message_id = entry.get("message_id")
+            if not isinstance(source_chat_id, int) or not isinstance(message_id, int):
+                skipped_invalid += 1
+                continue
+            if source_chat_id not in known_source_ids:
+                skipped_unknown_source += 1
+                continue
+            if (source_chat_id, message_id) in existing_pairs:
+                skipped_duplicate += 1
+                continue
+
+            posts.append(
+                {
+                    "post_uid": storage.new_uid(),
+                    "source_chat_id": source_chat_id,
+                    "message_ids": [message_id],
+                    "type": "single",
+                    "added_at": storage.now_iso(),
+                }
+            )
+            existing_pairs.add((source_chat_id, message_id))
+            imported += 1
+
+        await storage.save_posts(posts)
+        await message.answer(
+            "✅ Import complete\n\n"
+            f"Imported: {imported}\n"
+            f"Skipped (invalid entry): {skipped_invalid}\n"
+            f"Skipped (unknown source): {skipped_unknown_source}\n"
+            f"Skipped (duplicate): {skipped_duplicate}"
+        )
+
+    @dp.message(Command("scan"))
+    @owner_only
+    async def cmd_scan(message: Message) -> None:
+        posts = await storage.get_posts()
+        await message.answer(
+            "ℹ️ <b>Telegram Bot API limitation</b>\n\n"
+            "A normal bot cannot retrieve arbitrary old channel history.\n\n"
+            "You can:\n"
+            "1. Automatically capture new posts from configured source channels.\n"
+            "2. Import existing message IDs using /importposts.\n\n"
+            f"Currently loaded: {len(posts)} post(s)"
+        )
+
+    # -- scheduler control ------------------------------------------------
+
+    @dp.message(Command("startschedule"))
+    @owner_only
+    async def cmd_startschedule(message: Message) -> None:
+        ok, msg = await scheduler.start()
+        await message.answer(("✅ " if ok else "ℹ️ ") + esc(msg))
+
+    @dp.message(Command("stopschedule"))
+    @owner_only
+    async def cmd_stopschedule(message: Message) -> None:
+        ok, msg = await scheduler.stop()
+        await message.answer(("✅ " if ok else "ℹ️ ") + esc(msg))
+
+    @dp.message(Command("setinterval"))
+    @owner_only
+    async def cmd_setinterval(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            await message.answer("Usage: <code>/setinterval 30</code>")
+            return
+        minutes = int(parts[1].strip())
+        if minutes <= 0:
+            await message.answer("❌ Interval must be a positive number of minutes.")
+            return
+        settings = await storage.get_settings()
+        settings["interval_minutes"] = minutes
+        await storage.save_settings(settings)
+        await message.answer(f"✅ Interval set to {minutes} minutes.")
+
+    @dp.message(Command("setsourcemode"))
+    @owner_only
+    async def cmd_setsourcemode(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        mode = parts[1].strip().lower() if len(parts) > 1 else ""
+        if mode not in ("round_robin", "sequential"):
+            await message.answer("Usage: <code>/setsourcemode round_robin</code> or <code>/setsourcemode sequential</code>")
+            return
+        settings = await storage.get_settings()
+        settings["source_mode"] = mode
+        await storage.save_settings(settings)
+        await message.answer(f"✅ Source mode set to {esc(mode.upper())}.")
+
+    @dp.message(Command("reset"))
+    @owner_only
+    async def cmd_reset(message: Message) -> None:
+        await scheduler.reset()
+        await message.answer("✅ Schedule progress reset to post #1.")
+
+    @dp.message(Command("reload"))
+    @owner_only
+    async def cmd_reload(message: Message) -> None:
+        # Re-read all JSON storage from disk (picks up manual edits).
+        await storage.get_sources()
+        await storage.get_channels()
+        await storage.get_posts()
+        await storage.get_schedule()
+        await storage.get_settings()
+        await message.answer("✅ Configuration reloaded from disk.")
+
+    # -- status / next --------------------------------------------------------
+
+    @dp.message(Command("status"))
+    async def cmd_status(message: Message) -> None:
+        sources = await storage.get_sources()
+        channels = await storage.get_channels()
+        posts = await storage.get_posts()
+        schedule = await storage.get_schedule()
+        settings = await Scheduler.get_effective_settings()
+
+        queue = await Scheduler.build_queue()
+        total = len(queue)
+        current_index = schedule.get("current_index", 0) % total if total else 0
+        next_run = schedule.get("next_run_iso") or "not scheduled yet"
+
+        active_sources = sum(1 for s in sources if s.get("enabled", True))
+        active_channels = sum(1 for c in channels if c.get("enabled", True))
+
+        lines = [
+            "🤖 <b>BOT STATUS</b>",
+            "",
+            "Bot: ✅ Online",
+            f"Scheduler: {'🟢 Running' if scheduler.is_running() else '🔴 Stopped'}",
+            "",
+            f"Interval: {settings['interval_minutes']} minutes",
+            "",
+            f"Source channels: {active_sources} (of {len(sources)})",
+            f"Destination channels: {active_channels} (of {len(channels)})",
+            "",
+            f"Posts loaded: {len(posts)}",
+            "",
+            f"Current post: #{current_index + 1 if total else 0}",
+            f"Next post: #{(current_index % total) + 1 if total else 0}",
+            "",
+            f"Next run:\n{esc(next_run)}",
+            "",
+            f"Cycle:\n{current_index + 1 if total else 0} / {total}",
+            "",
+            f"Source mode:\n{esc(settings['source_mode'].upper())}",
+        ]
+        await message.answer("\n".join(lines))
+
+    @dp.message(Command("next"))
+    async def cmd_next(message: Message) -> None:
+        queue = await Scheduler.build_queue()
+        if not queue:
+            await message.answer("⏭ <b>NEXT POST</b>\n\nNo posts are currently queued.")
+            return
+        schedule = await storage.get_schedule()
+        index = schedule.get("current_index", 0) % len(queue)
+        post = queue[index]
+        sources = await storage.get_sources()
+        src = next((s for s in sources if s["chat_id"] == post["source_chat_id"]), None)
+        src_name = src.get("title") if src else str(post["source_chat_id"])
+        post_type = "ALBUM" if post.get("type") == "album" else "SINGLE POST"
+        next_run = schedule.get("next_run_iso") or "not scheduled yet"
+
+        await message.answer(
+            "⏭ <b>NEXT POST</b>\n\n"
+            f"Post: #{index + 1}\n"
+            f"Source: {esc(src_name)}\n"
+            f"Type: {esc(post_type)}\n\n"
+            f"Scheduled:\n{esc(next_run)}"
+        )
+
+    # -- automatic new-post capture ------------------------------------------
+
+    @dp.channel_post()
+    async def on_channel_post(message: Message) -> None:
+        settings = await storage.get_settings()
+        auto_queue = settings.get("auto_queue_new_posts")
+        if auto_queue is None:
+            auto_queue = CONFIG.auto_queue_new_posts
+        if not auto_queue:
+            return
+
+        sources = await storage.get_sources()
+        source_ids = {s["chat_id"] for s in sources if s.get("enabled", True)}
+        if message.chat.id not in source_ids:
+            return  # ignore sources that are not configured
+
+        posts = await storage.get_posts()
+        existing_pairs = {
+            (p["source_chat_id"], mid) for p in posts for mid in p["message_ids"]
+        }
+        if (message.chat.id, message.message_id) in existing_pairs:
+            return  # avoid duplicate IDs
+
+        media_group_id = message.media_group_id
+        if media_group_id:
+            # Try to append to an existing in-progress album entry for this group.
+            match = next(
+                (
+                    p
+                    for p in posts
+                    if p.get("media_group_id") == media_group_id
+                    and p["source_chat_id"] == message.chat.id
+                ),
+                None,
+            )
+            if match:
+                if message.message_id not in match["message_ids"]:
+                    match["message_ids"].append(message.message_id)
+                    match["message_ids"].sort()
+            else:
+                posts.append(
+                    {
+                        "post_uid": storage.new_uid(),
+                        "source_chat_id": message.chat.id,
+                        "message_ids": [message.message_id],
+                        "type": "album",
+                        "media_group_id": media_group_id,
+                        "added_at": storage.now_iso(),
+                    }
+                )
+        else:
+            posts.append(
+                {
+                    "post_uid": storage.new_uid(),
+                    "source_chat_id": message.chat.id,
+                    "message_ids": [message.message_id],
+                    "type": "single",
+                    "added_at": storage.now_iso(),
+                }
+            )
+
+        await storage.save_posts(posts)
+        logger.info(
+            "[INFO] Captured new post from source %s (message %s)",
+            message.chat.id,
+            message.message_id,
+        )
+
+    # -- fallback for unknown commands from non-owners ----------------------
+
+    @dp.message(F.text.startswith("/"))
+    async def on_unknown_command(message: Message) -> None:
+        is_owner = message.from_user is not None and message.from_user.id == CONFIG.owner_id
+        if not is_owner:
+            await message.answer("⛔ Unknown command or restricted to the bot owner. Send /help.")
