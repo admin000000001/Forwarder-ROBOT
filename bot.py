@@ -1,155 +1,123 @@
 """
 bot.py
 
-Entry point. Startup order:
-  1. Config already validated at import time (config.py exits on error).
-  2. Validate/load JSON state files.
-  3. Verify the bot can see the source channel and is an admin there.
-  4. Build the Bot/Dispatcher, register handlers.
-  5. Start the scheduler wake-loop as an independent asyncio task, isolated
-     from polling errors (an exception in one never kills the other).
-  6. Start polling.
-  7. Handle SIGINT/SIGTERM for a clean shutdown that never corrupts JSON.
+Entry point. Startup sequence:
+  1. Load .env                       (config.py, on import)
+  2. Validate BOT_TOKEN               (config.py, on import)
+  3. Validate OWNER_ID                (config.py, on import)
+  4. Load JSON storage
+  5. Initialize bot
+  6. Call get_me()
+  7. Verify configured source channels
+  8. Verify destination channels
+  9. Load posts
+  10. Load scheduler state
+  11. Start scheduler (if it was running before restart)
+  12. Start polling
 """
 
 from __future__ import annotations
 
 import asyncio
-import signal
+import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 
 import storage
 from config import CONFIG
-from utils import log
-from scheduler import VideoScheduler
-import handlers
+from handlers import register_handlers
+from scheduler import Scheduler
+from telegram_utils import verify_chat_access
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("forwarder")
 
 
-async def validate_source_channel(bot: Bot) -> None:
-    try:
-        chat = await bot.get_chat(CONFIG.source_channel_id)
-    except Exception as e:
-        log.error(f"Cannot access SOURCE_CHANNEL_ID ({CONFIG.source_channel_id}): {e}")
-        log.error("Make sure the bot has been added as an admin to the source channel.")
-        raise SystemExit(1)
+async def _startup_checks(bot: Bot) -> None:
+    logger.info("[INFO] Bot starting...")
 
     try:
         me = await bot.get_me()
-        member = await bot.get_chat_member(CONFIG.source_channel_id, me.id)
-        if member.status not in ("administrator", "creator"):
-            log.error(
-                f"Bot is not an administrator in source channel '{chat.title}'. "
-                "Please promote it to admin."
-            )
-            raise SystemExit(1)
-    except SystemExit:
-        raise
-    except Exception as e:
-        log.error(f"Could not verify admin status in source channel: {e}")
+    except TelegramUnauthorizedError:
+        print("[CONFIG ERROR] Invalid BOT_TOKEN — Telegram rejected the credentials.")
+        raise SystemExit(1)
+    except (TelegramNetworkError, TimeoutError) as exc:
+        print(f"[CONFIG ERROR] Network error while contacting Telegram: {exc}")
         raise SystemExit(1)
 
-    log.info(f"Source channel loaded: {chat.title} ({CONFIG.source_channel_id})")
+    logger.info("[SUCCESS] Authenticated as @%s", me.username)
 
+    # Verify configured source channels (never terminates the bot on failure).
+    sources = await storage.get_sources()
+    for source in sources:
+        result = await verify_chat_access(bot, source["chat_id"])
+        source["enabled"] = result.ok
+        if result.ok:
+            source["title"] = result.title or source.get("title")
+            source["username"] = result.username
+            logger.info("[SUCCESS] Source channel loaded: %s", source["title"])
+        else:
+            logger.warning(
+                "[WARNING] Source unavailable (%s): %s", source["chat_id"], result.error
+            )
+    if sources:
+        await storage.save_sources(sources)
 
-async def validate_destination_channels(bot: Bot) -> None:
+    # Verify configured destination channels.
     channels = await storage.get_channels()
-    ok_count = 0
-    for channel_id in channels:
-        try:
-            me = await bot.get_me()
-            member = await bot.get_chat_member(channel_id, me.id)
-            if member.status in ("administrator", "creator"):
-                ok_count += 1
-            else:
-                log.warning(f"Bot is not admin in destination channel {channel_id}")
-        except Exception as e:
-            log.warning(f"Could not verify destination channel {channel_id}: {e}")
-    log.info(f"{ok_count}/{len(channels)} destination channels verified")
+    verified_count = 0
+    for channel in channels:
+        result = await verify_chat_access(bot, channel["chat_id"])
+        channel["enabled"] = result.ok
+        if result.ok:
+            channel["title"] = result.title or channel.get("title")
+            channel["username"] = result.username
+            verified_count += 1
+        else:
+            logger.warning(
+                "[WARNING] Destination unavailable (%s): %s",
+                channel["chat_id"],
+                result.error,
+            )
+    if channels:
+        await storage.save_channels(channels)
+    logger.info("[SUCCESS] Destination channels verified: %s", verified_count)
+
+    posts = await storage.get_posts()
+    logger.info("[INFO] Posts loaded: %s", len(posts))
 
 
 async def main() -> None:
-    log.info("Bot starting...")
-
     bot = Bot(
         token=CONFIG.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
-    dp.include_router(handlers.router)
+    scheduler = Scheduler(bot)
 
     try:
-        me = await bot.get_me()
-    except TelegramUnauthorizedError:
-        log.error("BOT_TOKEN is invalid. Get a valid token from @BotFather.")
-        raise SystemExit(1)
+        await _startup_checks(bot)
 
-    log.info(f"Authenticated as @{me.username}")
+        register_handlers(dp, bot, scheduler)
 
-    await validate_source_channel(bot)
-    await validate_destination_channels(bot)
+        logger.info("[INFO] Scheduler state loaded")
+        await scheduler.resume_if_needed()
 
-    videos_data = await storage.get_videos()
-    log.info(f"{len(videos_data.get('videos', []))} video(s) currently loaded")
-
-    channels = await storage.get_channels()
-    log.info(f"{len(channels)} destination channel(s) loaded")
-
-    scheduler = VideoScheduler(bot)
-    handlers.bind_scheduler(scheduler)
-
-    # Resolve any interrupted delivery / stale state left over from an
-    # unexpected previous shutdown before we start taking new commands.
-    schedule = await storage.get_schedule()
-    if schedule.get("in_progress_index") is not None:
-        log.info(
-            f"Detected an interrupted delivery for video index "
-            f"{schedule['in_progress_index']} from a previous run; it will "
-            "resume automatically (already-delivered channels are skipped)."
-        )
-
-    scheduler.start_loop()
-    log.info("Scheduler task started")
-
-    stop_event = asyncio.Event()
-
-    def _handle_signal() -> None:
-        log.info("Shutdown signal received")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            # Windows / some restricted environments don't support this.
-            pass
-
-    polling_task = asyncio.create_task(dp.start_polling(bot), name="polling")
-
-    log.info("Bot is now polling for updates")
-
-    await stop_event.wait()
-
-    log.info("Shutting down gracefully...")
-    polling_task.cancel()
-    await scheduler.stop_loop()
-    try:
-        await polling_task
-    except asyncio.CancelledError:
-        pass
-
-    await bot.session.close()
-    log.info("Shutdown complete. State has been preserved in data/*.json")
+        logger.info("[INFO] Starting polling")
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except SystemExit:
-        raise
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
+    except (KeyboardInterrupt, SystemExit):
+        pass
