@@ -1,107 +1,171 @@
-""
-config.py
-
-Loads and validates configuration from environment variables (.env).
-No secrets are ever hardcoded here. If required variables are missing,
-the process exits with a clear error message before anything else runs.
-"""
-
 from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    # python-dotenv is optional at runtime (e.g. if env vars are injected
-    # directly by the host / systemd / Docker). We degrade gracefully.
     pass
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-
-VIDEOS_FILE = DATA_DIR / "videos.json"
-CHANNELS_FILE = DATA_DIR / "channels.json"
-SCHEDULE_FILE = DATA_DIR / "schedule.json"
 
 VALID_MISSED_POLICIES = {"next", "skip_all"}
+VALID_SOURCE_MODES = {"sequential", "round_robin"}
 
 
 def _die(message: str) -> None:
     print(f"[CONFIG ERROR] {message}", file=sys.stderr)
-    sys.exit(1)
+    raise SystemExit(1)
 
 
-def _get_int_env(name: str, required: bool = True, default: int | None = None) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        if required:
-            _die(f"Missing required environment variable: {name}")
-        return default
+def _get_required(name: str) -> str:
+    value = os.getenv(name)
+
+    if value is None or not value.strip():
+        _die(f"Missing required environment variable: {name}")
+
+    return value.strip()
+
+
+def _get_int(name: str, default: int | None = None) -> int:
+    value = os.getenv(name)
+
+    if value is None or not value.strip():
+        if default is not None:
+            return default
+
+        _die(f"Missing required environment variable: {name}")
+
     try:
-        return int(raw.strip())
+        return int(value.strip())
     except ValueError:
-        _die(f"Environment variable {name} must be an integer, got: {raw!r}")
-    return default  # unreachable, keeps type checkers happy
+        _die(
+            f"Environment variable {name} must be an integer, "
+            f"got: {value!r}"
+        )
+
+    raise RuntimeError("unreachable")
 
 
-def _get_bool_env(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
+def _get_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+
+    if value is None:
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
     bot_token: str
     owner_id: int
-    source_channel_id: int
+
     interval_minutes: int = 30
-    total_videos: int = 1440
-    shuffle: bool = False
+    total_posts: int = 1440
+
+    source_mode: str = "round_robin"
     missed_schedule_policy: str = "next"
+
     max_retries: int = 3
     retry_backoff_seconds: int = 5
 
+    auto_queue_new_posts: bool = True
+
 
 def load_config() -> Config:
-    bot_token = os.environ.get("BOT_TOKEN", "8188024272:AAGwsKUe-CuZegRYg-fNdvcnjUuNfXBE3QM").strip()
-    if not bot_token:
-        _die("Missing required environment variable: BOT_TOKEN")
 
-    owner_id = _get_int_env("8753552605")
-    source_channel_id = _get_int_env("-1003407857559")
+    # ---------------------------------------------------------
+    # Required
+    # ---------------------------------------------------------
 
-    interval_minutes = _get_int_env("INTERVAL_MINUTES", required=False, default=30) or 30
-    total_videos = _get_int_env("TOTAL_VIDEOS", required=False, default=1440) or 1440
-    shuffle = _get_bool_env("SHUFFLE", default=False)
+    bot_token = _get_required("BOT_TOKEN")
+    owner_id = _get_int("OWNER_ID")
 
-    missed_policy = os.environ.get("MISSED_SCHEDULE_POLICY", "next").strip().lower()
-    if missed_policy not in VALID_MISSED_POLICIES:
-        _die(
-            f"MISSED_SCHEDULE_POLICY must be one of {sorted(VALID_MISSED_POLICIES)}, "
-            f"got: {missed_policy!r}"
-        )
+    # ---------------------------------------------------------
+    # Optional
+    # ---------------------------------------------------------
+
+    interval_minutes = _get_int(
+        "INTERVAL_MINUTES",
+        30,
+    )
+
+    total_posts = _get_int(
+        "TOTAL_POSTS",
+        1440,
+    )
+
+    source_mode = os.getenv(
+        "SOURCE_MODE",
+        "round_robin",
+    ).strip().lower()
+
+    missed_schedule_policy = os.getenv(
+        "MISSED_SCHEDULE_POLICY",
+        "next",
+    ).strip().lower()
+
+    max_retries = _get_int(
+        "MAX_RETRIES",
+        3,
+    )
+
+    retry_backoff_seconds = _get_int(
+        "RETRY_BACKOFF_SECONDS",
+        5,
+    )
+
+    auto_queue_new_posts = _get_bool(
+        "AUTO_QUEUE_NEW_POSTS",
+        True,
+    )
+
+    # ---------------------------------------------------------
+    # Validation
+    # ---------------------------------------------------------
 
     if interval_minutes <= 0:
-        _die("INTERVAL_MINUTES must be a positive integer")
-    if total_videos <= 0:
-        _die("TOTAL_VIDEOS must be a positive integer")
+        _die("INTERVAL_MINUTES must be greater than 0")
+
+    if total_posts <= 0:
+        _die("TOTAL_POSTS must be greater than 0")
+
+    if max_retries <= 0:
+        _die("MAX_RETRIES must be greater than 0")
+
+    if retry_backoff_seconds < 0:
+        _die("RETRY_BACKOFF_SECONDS cannot be negative")
+
+    if source_mode not in VALID_SOURCE_MODES:
+        _die(
+            "SOURCE_MODE must be one of: "
+            + ", ".join(sorted(VALID_SOURCE_MODES))
+        )
+
+    if missed_schedule_policy not in VALID_MISSED_POLICIES:
+        _die(
+            "MISSED_SCHEDULE_POLICY must be one of: "
+            + ", ".join(sorted(VALID_MISSED_POLICIES))
+        )
 
     return Config(
         bot_token=bot_token,
-        owner_id=owner_id,  # type: ignore[arg-type]
-        source_channel_id=source_channel_id,  # type: ignore[arg-type]
+        owner_id=owner_id,
         interval_minutes=interval_minutes,
-        total_videos=total_videos,
-        shuffle=shuffle,
-        missed_schedule_policy=missed_policy,
+        total_posts=total_posts,
+        source_mode=source_mode,
+        missed_schedule_policy=missed_schedule_policy,
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        auto_queue_new_posts=auto_queue_new_posts,
     )
 
 
