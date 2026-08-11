@@ -592,3 +592,151 @@ def register_handlers(dp: Dispatcher, bot: Bot, scheduler: Scheduler) -> None:
         is_owner = message.from_user is not None and message.from_user.id == CONFIG.owner_id
         if not is_owner:
             await message.answer("⛔ Unknown command or restricted to the bot owner. Send /help.")
+# ============================================================
+# ROUTE MANAGEMENT
+# ============================================================
+
+@router.message(Command("addroute"))
+async def cmd_addroute(message: Message) -> None:
+
+    if not is_owner(message):
+        await message.reply("❌ Owner only.")
+        return
+
+    parts = (message.text or "").split()
+
+    if len(parts) != 3:
+        await message.reply(
+            "Usage:\n"
+            "/addroute <source_id> <destination_id>\n\n"
+            "Example:\n"
+            "/addroute -1001111111111 -1002111111111"
+        )
+        return
+
+    try:
+        source_id = int(parts[1])
+        destination_id = int(parts[2])
+
+    except ValueError:
+        await message.reply(
+            "❌ Source ID and destination ID must be numbers."
+        )
+        return
+
+    added = await storage.add_route(
+        source_id,
+        destination_id
+    )
+
+    if added:
+        await message.reply(
+            "✅ Route added.\n\n"
+            f"Source: <code>{source_id}</code>\n"
+            f"Destination: <code>{destination_id}</code>"
+        )
+    else:
+        await message.reply(
+            "ℹ️ This route already exists."
+        )
+
+
+@router.message(Command("removeroute"))
+async def cmd_removeroute(message: Message) -> None:
+
+    if not is_owner(message):
+        await message.reply("❌ Owner only.")
+        return
+
+    parts = (message.text or "").split()
+
+    if len(parts) != 3:
+        await message.reply(
+            "Usage:\n"
+            "/removeroute <source_id> <destination_id>"
+        )
+        return
+
+    try:
+        source_id = int(parts[1])
+        destination_id = int(parts[2])
+
+    except ValueError:
+        await message.reply(
+            "❌ Invalid channel ID."
+        )
+        return
+
+    removed = await storage.remove_route(
+        source_id,
+        destination_id
+    )
+
+    if removed:
+        await message.reply(
+            "✅ Route removed."
+        )
+    else:
+        await message.reply(
+            "❌ Route not found."
+        )
+
+
+@router.message(Command("routes"))
+async def cmd_routes(message: Message) -> None:
+
+    if not is_owner(message):
+        await message.reply("❌ Owner only.")
+        return
+
+    routes = await storage.get_routes()
+
+    if not routes:
+        await message.reply(
+            "📭 No source → destination routes configured."
+        )
+        return
+
+    lines = [
+        "🔀 <b>Source → Destination Routes</b>",
+        ""
+    ]
+
+    for route in routes:
+
+        source_id = route.get("source_id")
+
+        destinations = route.get(
+            "destinations",
+            []
+        )
+
+        lines.append(
+            f"📥 <code>{source_id}</code>"
+        )
+
+        for destination_id in destinations:
+
+            lines.append(
+                f"   └── 📤 <code>{destination_id}</code>"
+            )
+
+        lines.append("")
+
+    await message.reply(
+        "\n".join(lines)
+    )
+
+
+@router.message(Command("clearoutes"))
+async def cmd_clearoutes(message: Message) -> None:
+
+    if not is_owner(message):
+        await message.reply("❌ Owner only.")
+        return
+
+    await storage.clear_routes()
+
+    await message.reply(
+        "🗑 All source → destination routes removed."
+)
