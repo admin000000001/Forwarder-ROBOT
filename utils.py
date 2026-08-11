@@ -126,5 +126,3 @@ def _write_json_sync(path: Path, data: Any) -> None:
 
 async def write_json(path: Path, data: Any) -> None:
     lock = _lock_for(path)
-    async with lock:
-        await asyncio.to_thread(_write_json_sync, path, data)
