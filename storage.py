@@ -1,47 +1,41 @@
+"""
+storage.py
+Persistent JSON storage for Telegram Forwarder Bot.
+
+Files:
+    sources.json
+    channels.json
+    routes.json
+    posts.json
+    schedule.json
+    settings.json
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
+import tempfile
 from datetime import datetime, timezone
 from typing import Any
 
-logger = logging.getLogger("forwarder")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DATA_DIR = os.path.join(BASE_DIR, "data")
-
-SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
-CHANNELS_FILE = os.path.join(DATA_DIR, "channels.json")
-POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
-SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
-SCHEDULE_FILE = os.path.join(DATA_DIR, "schedule.json")
+SOURCES_FILE = os.path.join(BASE_DIR, "sources.json")
+CHANNELS_FILE = os.path.join(BASE_DIR, "channels.json")
+ROUTES_FILE = os.path.join(BASE_DIR, "routes.json")
+POSTS_FILE = os.path.join(BASE_DIR, "posts.json")
+SCHEDULE_FILE = os.path.join(BASE_DIR, "schedule.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 _LOCK = asyncio.Lock()
 
 
 # ============================================================
-# DIRECTORY
-# ============================================================
-
-def _ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-# ============================================================
 # DEFAULTS
 # ============================================================
-
-DEFAULT_SETTINGS = {
-    "interval_minutes": 10,
-    "source_mode": "round_robin",
-    "missed_schedule_policy": "next",
-    "total_posts": 0,
-    "routes": [],
-}
-
 
 DEFAULT_SCHEDULE = {
     "running": False,
@@ -50,53 +44,101 @@ DEFAULT_SCHEDULE = {
     "last_completed_iso": None,
 }
 
+DEFAULT_SETTINGS = {
+    "interval_minutes": 10,
+    "source_mode": "round_robin",
+    "missed_schedule_policy": "skip",
+    "total_posts": 0,
+}
+
 
 # ============================================================
 # JSON HELPERS
 # ============================================================
 
-def _read_json_sync(path: str, default: Any) -> Any:
-    _ensure_data_dir()
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_json_sync(
+    path: str,
+    default: Any,
+) -> Any:
 
     if not os.path.exists(path):
         return default
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(
+            path,
+            "r",
+            encoding="utf-8",
+        ) as f:
             return json.load(f)
 
-    except Exception as exc:
-        logger.error(
-            "[STORAGE] Failed reading %s: %s",
-            path,
-            exc,
-        )
-
+    except Exception:
         return default
 
 
-def _write_json_sync(path: str, data: Any) -> None:
-    _ensure_data_dir()
+def _write_json_sync(
+    path: str,
+    data: Any,
+) -> None:
 
-    temp = path + ".tmp"
+    directory = os.path.dirname(path)
 
-    with open(
-        temp,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False,
-            indent=2,
+    os.makedirs(
+        directory,
+        exist_ok=True,
+    )
+
+    # Atomic write
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".tmp_",
+        suffix=".json",
+        dir=directory,
+    )
+
+    try:
+
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(
+            temp_path,
+            path,
         )
 
-    os.replace(temp, path)
+    finally:
+
+        if os.path.exists(temp_path):
+
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
-async def _read(path: str, default: Any) -> Any:
+async def _read(
+    path: str,
+    default: Any,
+) -> Any:
+
     async with _LOCK:
+
         return await asyncio.to_thread(
             _read_json_sync,
             path,
@@ -104,8 +146,13 @@ async def _read(path: str, default: Any) -> Any:
         )
 
 
-async def _write(path: str, data: Any) -> None:
+async def _write(
+    path: str,
+    data: Any,
+) -> None:
+
     async with _LOCK:
+
         await asyncio.to_thread(
             _write_json_sync,
             path,
@@ -118,6 +165,7 @@ async def _write(path: str, data: Any) -> None:
 # ============================================================
 
 async def get_sources() -> list[dict[str, Any]]:
+
     data = await _read(
         SOURCES_FILE,
         [],
@@ -133,46 +181,9 @@ async def save_sources(
     sources: list[dict[str, Any]],
 ) -> None:
 
-    clean: list[dict[str, Any]] = []
-
-    seen: set[int] = set()
-
-    for source in sources:
-
-        try:
-            chat_id = int(
-                source.get("chat_id")
-            )
-        except Exception:
-            continue
-
-        if chat_id in seen:
-            continue
-
-        seen.add(chat_id)
-
-        clean.append(
-            {
-                "chat_id": chat_id,
-                "title": source.get(
-                    "title",
-                    "Unknown",
-                ),
-                "username": source.get(
-                    "username"
-                ),
-                "enabled": bool(
-                    source.get(
-                        "enabled",
-                        True,
-                    )
-                ),
-            }
-        )
-
     await _write(
         SOURCES_FILE,
-        clean,
+        sources,
     )
 
 
@@ -180,21 +191,32 @@ async def add_source(
     chat_id: int,
     title: str | None = None,
     username: str | None = None,
-) -> bool:
+) -> tuple[bool, str]:
+
+    chat_id = int(chat_id)
 
     sources = await get_sources()
 
     for source in sources:
-        try:
-            if int(source["chat_id"]) == int(chat_id):
-                return False
-        except Exception:
-            continue
+
+        if int(source.get("chat_id", 0)) == chat_id:
+
+            source["enabled"] = True
+
+            if title:
+                source["title"] = title
+
+            if username:
+                source["username"] = username
+
+            await save_sources(sources)
+
+            return False, "Source already exists."
 
     sources.append(
         {
-            "chat_id": int(chat_id),
-            "title": title or "Unknown",
+            "chat_id": chat_id,
+            "title": title or str(chat_id),
             "username": username,
             "enabled": True,
         }
@@ -202,35 +224,42 @@ async def add_source(
 
     await save_sources(sources)
 
-    return True
+    return True, "Source added successfully."
 
 
 async def remove_source(
     chat_id: int,
 ) -> bool:
 
+    chat_id = int(chat_id)
+
     sources = await get_sources()
 
-    new_sources = []
+    old_len = len(sources)
 
-    removed = False
+    sources = [
+        s
+        for s in sources
+        if int(s.get("chat_id", 0)) != chat_id
+    ]
 
-    for source in sources:
+    if len(sources) == old_len:
+        return False
 
-        try:
-            sid = int(source["chat_id"])
-        except Exception:
-            continue
+    await save_sources(sources)
 
-        if sid == int(chat_id):
-            removed = True
-            continue
+    # Also remove route
+    routes = await get_routes()
 
-        new_sources.append(source)
+    routes = [
+        r
+        for r in routes
+        if int(r.get("source_id", 0)) != chat_id
+    ]
 
-    await save_sources(new_sources)
+    await save_routes(routes)
 
-    return removed
+    return True
 
 
 # ============================================================
@@ -238,6 +267,7 @@ async def remove_source(
 # ============================================================
 
 async def get_channels() -> list[dict[str, Any]]:
+
     data = await _read(
         CHANNELS_FILE,
         [],
@@ -253,46 +283,9 @@ async def save_channels(
     channels: list[dict[str, Any]],
 ) -> None:
 
-    clean: list[dict[str, Any]] = []
-
-    seen: set[int] = set()
-
-    for channel in channels:
-
-        try:
-            chat_id = int(
-                channel.get("chat_id")
-            )
-        except Exception:
-            continue
-
-        if chat_id in seen:
-            continue
-
-        seen.add(chat_id)
-
-        clean.append(
-            {
-                "chat_id": chat_id,
-                "title": channel.get(
-                    "title",
-                    "Unknown",
-                ),
-                "username": channel.get(
-                    "username"
-                ),
-                "enabled": bool(
-                    channel.get(
-                        "enabled",
-                        True,
-                    )
-                ),
-            }
-        )
-
     await _write(
         CHANNELS_FILE,
-        clean,
+        channels,
     )
 
 
@@ -300,22 +293,32 @@ async def add_channel(
     chat_id: int,
     title: str | None = None,
     username: str | None = None,
-) -> bool:
+) -> tuple[bool, str]:
+
+    chat_id = int(chat_id)
 
     channels = await get_channels()
 
     for channel in channels:
 
-        try:
-            if int(channel["chat_id"]) == int(chat_id):
-                return False
-        except Exception:
-            continue
+        if int(channel.get("chat_id", 0)) == chat_id:
+
+            channel["enabled"] = True
+
+            if title:
+                channel["title"] = title
+
+            if username:
+                channel["username"] = username
+
+            await save_channels(channels)
+
+            return False, "Destination already exists."
 
     channels.append(
         {
-            "chat_id": int(chat_id),
-            "title": title or "Unknown",
+            "chat_id": chat_id,
+            "title": title or str(chat_id),
             "username": username,
             "enabled": True,
         }
@@ -323,35 +326,225 @@ async def add_channel(
 
     await save_channels(channels)
 
-    return True
+    return True, "Destination added successfully."
 
 
 async def remove_channel(
     chat_id: int,
 ) -> bool:
 
+    chat_id = int(chat_id)
+
     channels = await get_channels()
 
-    new_channels = []
+    old_len = len(channels)
 
-    removed = False
+    channels = [
+        c
+        for c in channels
+        if int(c.get("chat_id", 0)) != chat_id
+    ]
 
-    for channel in channels:
+    if len(channels) == old_len:
+        return False
+
+    await save_channels(channels)
+
+    # Remove this destination from all routes
+    routes = await get_routes()
+
+    changed = False
+
+    for route in routes:
+
+        old_destinations = route.get(
+            "destinations",
+            [],
+        )
+
+        new_destinations = [
+            int(x)
+            for x in old_destinations
+            if int(x) != chat_id
+        ]
+
+        if new_destinations != old_destinations:
+            changed = True
+
+        route["destinations"] = new_destinations
+
+    if changed:
+        await save_routes(routes)
+
+    return True
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+async def get_routes() -> list[dict[str, Any]]:
+
+    data = await _read(
+        ROUTES_FILE,
+        [],
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    # Normalize
+    normalized = []
+
+    for route in data:
 
         try:
-            cid = int(channel["chat_id"])
+            source_id = int(
+                route.get("source_id")
+            )
         except Exception:
             continue
 
-        if cid == int(chat_id):
-            removed = True
+        destinations = []
+
+        for dest in route.get(
+            "destinations",
+            [],
+        ):
+
+            try:
+                destinations.append(int(dest))
+            except Exception:
+                pass
+
+        normalized.append(
+            {
+                "source_id": source_id,
+                "destinations": list(
+                    dict.fromkeys(destinations)
+                ),
+            }
+        )
+
+    return normalized
+
+
+async def save_routes(
+    routes: list[dict[str, Any]],
+) -> None:
+
+    await _write(
+        ROUTES_FILE,
+        routes,
+    )
+
+
+async def add_route(
+    source_id: int,
+    destination_id: int,
+) -> tuple[bool, str]:
+
+    source_id = int(source_id)
+    destination_id = int(destination_id)
+
+    routes = await get_routes()
+
+    route = None
+
+    for item in routes:
+
+        if int(item["source_id"]) == source_id:
+
+            route = item
+            break
+
+    if route is None:
+
+        route = {
+            "source_id": source_id,
+            "destinations": [],
+        }
+
+        routes.append(route)
+
+    if destination_id in route["destinations"]:
+
+        return False, "Route already exists."
+
+    route["destinations"].append(
+        destination_id
+    )
+
+    await save_routes(routes)
+
+    return True, "Route added successfully."
+
+
+async def remove_route(
+    source_id: int,
+    destination_id: int,
+) -> bool:
+
+    source_id = int(source_id)
+    destination_id = int(destination_id)
+
+    routes = await get_routes()
+
+    changed = False
+
+    for route in routes:
+
+        if int(route["source_id"]) != source_id:
             continue
 
-        new_channels.append(channel)
+        old = route.get(
+            "destinations",
+            [],
+        )
 
-    await save_channels(new_channels)
+        new = [
+            int(x)
+            for x in old
+            if int(x) != destination_id
+        ]
 
-    return removed
+        if new != old:
+            changed = True
+
+        route["destinations"] = new
+
+    if changed:
+        await save_routes(routes)
+
+    return changed
+
+
+async def clear_routes() -> None:
+
+    await save_routes([])
+
+
+async def get_destinations_for_source(
+    source_id: int,
+) -> list[int]:
+
+    source_id = int(source_id)
+
+    routes = await get_routes()
+
+    for route in routes:
+
+        if int(route["source_id"]) == source_id:
+
+            return [
+                int(x)
+                for x in route.get(
+                    "destinations",
+                    [],
+                )
+            ]
+
+    return []
 
 
 # ============================================================
@@ -359,6 +552,7 @@ async def remove_channel(
 # ============================================================
 
 async def get_posts() -> list[dict[str, Any]]:
+
     data = await _read(
         POSTS_FILE,
         [],
@@ -381,86 +575,105 @@ async def save_posts(
 
 
 async def add_post(
-    post: dict[str, Any],
+    source_chat_id: int,
+    message_id: int,
+    message_type: str = "message",
+    media_group_id: str | None = None,
+    caption: str | None = None,
 ) -> bool:
-    """
-    Add one post.
 
-    Duplicate detection:
-        source_chat_id + message_ids
-    """
+    source_chat_id = int(source_chat_id)
+    message_id = int(message_id)
 
     posts = await get_posts()
 
-    source_id = post.get(
-        "source_chat_id"
-    )
+    # Do not duplicate
+    for post in posts:
 
-    message_ids = post.get(
-        "message_ids",
-        [],
-    )
+        if int(
+            post.get(
+                "source_chat_id",
+                0,
+            )
+        ) != source_chat_id:
+            continue
 
-    if not message_ids:
-
-        message_id = post.get(
-            "message_id"
+        ids = post.get(
+            "message_ids",
+            [],
         )
 
-        if message_id is not None:
-            message_ids = [
-                message_id
-            ]
-
-    try:
-        source_id = int(source_id)
-        message_ids = [
+        if message_id in [
             int(x)
-            for x in message_ids
-        ]
-    except Exception:
-        return False
+            for x in ids
+        ]:
+            return False
+
+    posts.append(
+        {
+            "source_chat_id": source_chat_id,
+            "message_ids": [
+                message_id
+            ],
+            "message_id": message_id,
+            "type": message_type,
+            "media_group_id": media_group_id,
+            "caption": caption,
+            "created_at": now_iso(),
+        }
+    )
+
+    await save_posts(posts)
+
+    return True
+
+
+async def add_album_post(
+    source_chat_id: int,
+    message_ids: list[int],
+    media_group_id: str,
+    message_type: str = "album",
+) -> bool:
+
+    source_chat_id = int(source_chat_id)
+
+    message_ids = [
+        int(x)
+        for x in message_ids
+    ]
 
     if not message_ids:
         return False
 
-    # --------------------------------------------------------
-    # Duplicate check
-    # --------------------------------------------------------
+    posts = await get_posts()
 
-    for existing in posts:
+    for post in posts:
 
-        try:
-            existing_source = int(
-                existing.get(
-                    "source_chat_id"
-                )
+        if int(
+            post.get(
+                "source_chat_id",
+                0,
             )
-
-            existing_ids = [
-                int(x)
-                for x in existing.get(
-                    "message_ids",
-                    [],
-                )
-            ]
-
-        except Exception:
+        ) != source_chat_id:
             continue
 
         if (
-            existing_source == source_id
-            and existing_ids == message_ids
+            post.get("media_group_id")
+            == media_group_id
         ):
             return False
 
-    post["source_chat_id"] = source_id
-    post["message_ids"] = message_ids
-
-    if "created_at" not in post:
-        post["created_at"] = now_iso()
-
-    posts.append(post)
+    posts.append(
+        {
+            "source_chat_id": source_chat_id,
+            "message_ids": message_ids,
+            "message_id": message_ids[0],
+            "type": message_type,
+            "media_group_id": media_group_id,
+            "caption": None,
+            "created_at": now_iso(),
+        }
+    )
 
     await save_posts(posts)
 
@@ -468,153 +681,8 @@ async def add_post(
 
 
 async def clear_posts() -> None:
+
     await save_posts([])
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-async def get_settings() -> dict[str, Any]:
-
-    data = await _read(
-        SETTINGS_FILE,
-        {},
-    )
-
-    if not isinstance(data, dict):
-        data = {}
-
-    result = dict(DEFAULT_SETTINGS)
-
-    result.update(data)
-
-    if not isinstance(
-        result.get("routes"),
-        list,
-    ):
-        result["routes"] = []
-
-    return result
-
-
-async def save_settings(
-    settings: dict[str, Any],
-) -> None:
-
-    current = dict(DEFAULT_SETTINGS)
-
-    current.update(settings)
-
-    await _write(
-        SETTINGS_FILE,
-        current,
-    )
-
-
-# ============================================================
-# ROUTES
-# ============================================================
-
-async def get_routes() -> list[dict[str, Any]]:
-
-    settings = await get_settings()
-
-    routes = settings.get(
-        "routes",
-        [],
-    )
-
-    if not isinstance(routes, list):
-        return []
-
-    clean: list[dict[str, Any]] = []
-
-    for route in routes:
-
-        if not isinstance(route, dict):
-            continue
-
-        try:
-            source_id = int(
-                route.get("source_id")
-            )
-        except Exception:
-            continue
-
-        destinations = []
-
-        for destination in route.get(
-            "destinations",
-            [],
-        ):
-
-            try:
-                destinations.append(
-                    int(destination)
-                )
-            except Exception:
-                continue
-
-        clean.append(
-            {
-                "source_id": source_id,
-                "destinations": list(
-                    dict.fromkeys(
-                        destinations
-                    )
-                ),
-            }
-        )
-
-    return clean
-
-
-async def save_routes(
-    routes: list[dict[str, Any]],
-) -> None:
-
-    settings = await get_settings()
-
-    clean: list[dict[str, Any]] = []
-
-    for route in routes:
-
-        try:
-            source_id = int(
-                route.get("source_id")
-            )
-        except Exception:
-            continue
-
-        destinations = []
-
-        for destination in route.get(
-            "destinations",
-            [],
-        ):
-
-            try:
-                destinations.append(
-                    int(destination)
-                )
-            except Exception:
-                continue
-
-        clean.append(
-            {
-                "source_id": source_id,
-                "destinations": list(
-                    dict.fromkeys(
-                        destinations
-                    )
-                ),
-            }
-        )
-
-    settings["routes"] = clean
-
-    await save_settings(settings)
 
 
 # ============================================================
@@ -625,16 +693,13 @@ async def get_schedule() -> dict[str, Any]:
 
     data = await _read(
         SCHEDULE_FILE,
-        {},
+        DEFAULT_SCHEDULE.copy(),
     )
 
     if not isinstance(data, dict):
-        data = {}
+        data = DEFAULT_SCHEDULE.copy()
 
-    result = dict(
-        DEFAULT_SCHEDULE
-    )
-
+    result = DEFAULT_SCHEDULE.copy()
     result.update(data)
 
     return result
@@ -644,23 +709,60 @@ async def save_schedule(
     schedule: dict[str, Any],
 ) -> None:
 
-    current = dict(
-        DEFAULT_SCHEDULE
-    )
-
-    current.update(schedule)
-
     await _write(
         SCHEDULE_FILE,
-        current,
+        schedule,
     )
 
 
 # ============================================================
-# TIME
+# SETTINGS
 # ============================================================
 
-def now_iso() -> str:
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+async def get_settings() -> dict[str, Any]:
+
+    data = await _read(
+        SETTINGS_FILE,
+        DEFAULT_SETTINGS.copy(),
+    )
+
+    if not isinstance(data, dict):
+        data = {}
+
+    result = DEFAULT_SETTINGS.copy()
+    result.update(data)
+
+    return result
+
+
+async def save_settings(
+    settings: dict[str, Any],
+) -> None:
+
+    await _write(
+        SETTINGS_FILE,
+        settings,
+    )
+
+
+# ============================================================
+# RESET
+# ============================================================
+
+async def clear_sources() -> None:
+
+    await save_sources([])
+
+    await clear_routes()
+
+
+async def clear_channels() -> None:
+
+    await save_channels([])
+
+    routes = await get_routes()
+
+    for route in routes:
+        route["destinations"] = []
+
+    await save_routes(routes)
