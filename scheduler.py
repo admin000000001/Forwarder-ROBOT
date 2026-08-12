@@ -1,28 +1,14 @@
 """
-scheduler.py
+Route-aware scheduler.
 
-Route-aware Telegram post scheduler.
+STRICT ROUTING:
 
-Routing model:
+Source A -> A destinations ONLY
+Source B -> B destinations ONLY
+Source C -> C destinations ONLY
 
-    Source A -> Destination A1, A2, A3
-    Source B -> Destination B1, B2, B3
-    Source C -> Destination C1, C2, C3
-
-Each post is distributed ONLY to destinations belonging
-to its own source route.
-
-Supported post types:
-    - single messages
-    - videos
-    - photos
-    - documents
-    - audio
-    - animations
-    - text/caption posts
-    - media albums/groups
-
-The actual Telegram copy operations are handled by telegram_utils.py.
+There is NO fallback that sends a source to every
+destination channel.
 """
 
 from __future__ import annotations
@@ -35,61 +21,76 @@ from typing import Any
 from aiogram import Bot
 
 import storage
+
 from config import CONFIG
+
 from telegram_utils import (
     copy_media_group_with_retry,
     copy_message_with_retry,
 )
 
+
 logger = logging.getLogger("forwarder")
 
 
 class Scheduler:
-    """
-    Single scheduler instance.
 
-    Important:
-        Only one scheduler loop can run at a time.
-    """
+    def __init__(
+        self,
+        bot: Bot,
+    ) -> None:
 
-    def __init__(self, bot: Bot) -> None:
         self.bot = bot
+
         self._task: asyncio.Task | None = None
 
     # ============================================================
-    # BASIC STATE
+    # STATE
     # ============================================================
 
     def is_running(self) -> bool:
-        return self._task is not None and not self._task.done()
 
-    async def start(self) -> tuple[bool, str]:
-        """
-        Start scheduler.
-        """
+        return (
+            self._task is not None
+            and not self._task.done()
+        )
+
+    async def start(
+        self,
+    ) -> tuple[bool, str]:
 
         if self.is_running():
-            return False, "Scheduler is already running."
+
+            return (
+                False,
+                "Scheduler is already running.",
+            )
 
         schedule = await storage.get_schedule()
 
         schedule["running"] = True
 
-        await storage.save_schedule(schedule)
+        await storage.save_schedule(
+            schedule
+        )
 
         self._task = asyncio.create_task(
             self._run_loop(),
             name="forwarder-scheduler",
         )
 
-        logger.info("[INFO] Scheduler started")
+        logger.info(
+            "[INFO] Scheduler started"
+        )
 
-        return True, "Scheduler started."
+        return (
+            True,
+            "Scheduler started.",
+        )
 
-    async def stop(self) -> tuple[bool, str]:
-        """
-        Stop scheduler safely.
-        """
+    async def stop(
+        self,
+    ) -> tuple[bool, str]:
 
         if not self.is_running():
 
@@ -97,408 +98,321 @@ class Scheduler:
 
             schedule["running"] = False
 
-            await storage.save_schedule(schedule)
+            await storage.save_schedule(
+                schedule
+            )
 
-            return False, "Scheduler is not running."
+            return (
+                False,
+                "Scheduler is not running.",
+            )
 
         task = self._task
 
-        if task is not None:
+        self._task = None
+
+        if task:
+
             task.cancel()
 
             try:
                 await task
+
             except asyncio.CancelledError:
                 pass
-
-        self._task = None
 
         schedule = await storage.get_schedule()
 
         schedule["running"] = False
 
-        await storage.save_schedule(schedule)
+        await storage.save_schedule(
+            schedule
+        )
 
-        logger.info("[INFO] Scheduler stopped")
+        logger.info(
+            "[INFO] Scheduler stopped"
+        )
 
-        return True, "Scheduler stopped."
+        return (
+            True,
+            "Scheduler stopped.",
+        )
 
-    async def resume_if_needed(self) -> None:
-        """
-        Resume scheduler after restart if it was running previously.
-        """
+    async def resume_if_needed(
+        self,
+    ) -> None:
 
         schedule = await storage.get_schedule()
 
-        if schedule.get("running"):
+        if not schedule.get("running"):
+            return
 
-            if self.is_running():
-                return
+        if self.is_running():
+            return
 
-            logger.info("[INFO] Resuming scheduler after restart")
+        logger.info(
+            "[INFO] Resuming scheduler"
+        )
 
-            self._task = asyncio.create_task(
-                self._run_loop(),
-                name="forwarder-scheduler",
-            )
+        self._task = asyncio.create_task(
+            self._run_loop(),
+            name="forwarder-scheduler",
+        )
 
     async def reset(self) -> None:
-        """
-        Reset scheduler position.
-        """
 
         schedule = await storage.get_schedule()
 
         schedule["current_index"] = 0
+
         schedule["next_run_iso"] = None
+
         schedule["last_completed_iso"] = None
 
-        await storage.save_schedule(schedule)
-
-        logger.info("[INFO] Scheduler sequence reset")
+        await storage.save_schedule(
+            schedule
+        )
 
     # ============================================================
     # SETTINGS
     # ============================================================
 
     @staticmethod
-    async def get_effective_settings() -> dict[str, Any]:
-        """
-        Merge persistent settings with CONFIG defaults.
-        """
+    async def settings() -> dict[str, Any]:
 
         settings = await storage.get_settings()
 
         return {
             "interval_minutes": (
-                settings.get("interval_minutes")
-                if settings.get("interval_minutes") is not None
+                settings.get(
+                    "interval_minutes"
+                )
+                if settings.get(
+                    "interval_minutes"
+                ) is not None
                 else CONFIG.interval_minutes
             ),
 
             "source_mode": (
-                settings.get("source_mode")
-                if settings.get("source_mode")
-                else CONFIG.source_mode
-            ),
-
-            "missed_schedule_policy": (
-                settings.get("missed_schedule_policy")
-                if settings.get("missed_schedule_policy")
-                else CONFIG.missed_schedule_policy
-            ),
-
-            "total_posts": (
-                settings.get("total_posts")
-                if settings.get("total_posts") is not None
-                else CONFIG.total_posts
-            ),
-        }
-
-    # ============================================================
-    # ROUTE HELPERS
-    # ============================================================
-
-    @staticmethod
-    async def get_routes() -> list[dict[str, Any]]:
-        """
-        Return configured source -> destination routes.
-
-        Expected storage format:
-
-        {
-            "routes": [
-                {
-                    "source_id": -1001111111111,
-                    "destinations": [
-                        -1002111111111,
-                        -1002111111112
-                    ]
-                }
-            ]
-        }
-
-        If the newer route storage helper exists, use it.
-        Otherwise construct routes from sources/channels.
-        """
-
-        # --------------------------------------------------------
-        # Preferred route storage
-        # --------------------------------------------------------
-
-        if hasattr(storage, "get_routes"):
-
-            try:
-                routes = await storage.get_routes()
-
-                if isinstance(routes, list):
-                    return routes
-
-            except Exception as exc:
-
-                logger.warning(
-                    "[WARNING] Could not load routes: %s",
-                    exc,
+                settings.get(
+                    "source_mode"
                 )
+                or CONFIG.source_mode
+                or "round_robin"
+            ),
+        }
 
-        # --------------------------------------------------------
-        # Compatibility fallback
-        # --------------------------------------------------------
-        #
-        # This fallback supports older projects where:
-        #
-        # sources.json
-        # channels.json
-        #
-        # are still used independently.
-        #
-        # In that case all enabled destinations are treated as
-        # destinations for all enabled sources.
-        #
-        # For TRUE source-specific routing, add route storage.
-        # --------------------------------------------------------
-
-        sources = await storage.get_sources()
-        channels = await storage.get_channels()
-
-        enabled_sources = [
-            s for s in sources
-            if s.get("enabled", True)
-        ]
-
-        enabled_destinations = [
-            c for c in channels
-            if c.get("enabled", True)
-        ]
-
-        routes: list[dict[str, Any]] = []
-
-        for source in enabled_sources:
-
-            source_id = source.get("chat_id")
-
-            if source_id is None:
-                continue
-
-            destinations = []
-
-            for channel in enabled_destinations:
-
-                dest_id = channel.get("chat_id")
-
-                if dest_id is not None:
-                    destinations.append(dest_id)
-
-            routes.append(
-                {
-                    "source_id": source_id,
-                    "destinations": destinations,
-                }
-            )
-
-        return routes
+    # ============================================================
+    # ROUTING
+    # ============================================================
 
     @staticmethod
-    async def get_route_for_source(
-        source_id: int,
-    ) -> dict[str, Any] | None:
-        """
-        Find the route belonging to a source.
-        """
-
-        routes = await Scheduler.get_routes()
-
-        for route in routes:
-
-            try:
-                route_source = int(route.get("source_id"))
-
-            except (TypeError, ValueError):
-                continue
-
-            if route_source == int(source_id):
-                return route
-
-        return None
-
-    @staticmethod
-    async def get_destinations_for_source(
+    async def destinations_for_source(
         source_id: int,
     ) -> list[int]:
         """
-        Return ONLY destinations assigned to this source.
+        STRICT route lookup.
+
+        Never uses channels.json as fallback.
         """
 
-        route = await Scheduler.get_route_for_source(source_id)
+        source_id = int(source_id)
 
-        if not route:
-            return []
+        destinations = (
+            await storage.get_destinations_for_source(
+                source_id
+            )
+        )
 
+        # Remove duplicates while preserving order.
         result: list[int] = []
 
-        for destination in route.get("destinations", []):
+        for destination in destinations:
 
-            try:
-                result.append(int(destination))
+            destination = int(
+                destination
+            )
 
-            except (TypeError, ValueError):
-                continue
+            if destination not in result:
+
+                result.append(
+                    destination
+                )
 
         return result
 
     # ============================================================
-    # QUEUE BUILDING
+    # QUEUE
     # ============================================================
 
     @staticmethod
     async def build_queue() -> list[dict[str, Any]]:
-        """
-        Build scheduler queue from all enabled sources.
-
-        round_robin:
-
-            A1
-            B1
-            C1
-            A2
-            B2
-            C2
-
-        sequential:
-
-            A1
-            A2
-            A3
-            B1
-            B2
-            B3
-            C1
-            C2
-            C3
-
-        IMPORTANT:
-
-        The queue contains posts only.
-
-        Destination selection happens later using the post's
-        source_chat_id.
-        """
 
         posts = await storage.get_posts()
 
         sources = await storage.get_sources()
 
-        enabled_source_ids = set()
+        enabled_sources: set[int] = set()
 
         for source in sources:
 
-            if not source.get("enabled", True):
-                continue
-
-            source_id = source.get("chat_id")
-
-            if source_id is None:
+            if not source.get(
+                "enabled",
+                True,
+            ):
                 continue
 
             try:
-                enabled_source_ids.add(int(source_id))
 
-            except (TypeError, ValueError):
+                source_id = int(
+                    source["chat_id"]
+                )
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
                 continue
 
-        # --------------------------------------------------------
-        # Group posts by source
-        # --------------------------------------------------------
+            enabled_sources.add(
+                source_id
+            )
 
-        by_source: dict[int, list[dict[str, Any]]] = {}
+        grouped: dict[
+            int,
+            list[dict[str, Any]]
+        ] = {}
 
         for post in posts:
 
-            source_id = post.get("source_chat_id")
-
-            if source_id is None:
-                continue
-
             try:
-                source_id = int(source_id)
 
-            except (TypeError, ValueError):
+                source_id = int(
+                    post["source_chat_id"]
+                )
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
                 continue
 
-            if source_id not in enabled_source_ids:
+            # Only enabled sources.
+            if source_id not in enabled_sources:
                 continue
 
-            by_source.setdefault(
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Posts without a configured route are ignored.
+            # ------------------------------------------------
+
+            destinations = (
+                await Scheduler.destinations_for_source(
+                    source_id
+                )
+            )
+
+            if not destinations:
+
+                logger.warning(
+                    "[WARNING] Source %s has no route; "
+                    "post ignored from queue.",
+                    source_id,
+                )
+
+                continue
+
+            grouped.setdefault(
                 source_id,
                 [],
             ).append(post)
 
-        # --------------------------------------------------------
-        # Sort each source by message ID
-        # --------------------------------------------------------
+        # Sort every source independently.
+        for source_id, source_posts in grouped.items():
 
-        for source_id in by_source:
-
-            by_source[source_id].sort(
-                key=lambda item: (
-                    min(
-                        item.get("message_ids", [0])
-                        or [0]
-                    )
+            source_posts.sort(
+                key=lambda post: min(
+                    [
+                        int(x)
+                        for x in post.get(
+                            "message_ids",
+                            [0],
+                        )
+                        if str(x).lstrip("-").isdigit()
+                    ]
+                    or [0]
                 )
             )
 
-        settings = await Scheduler.get_effective_settings()
+        settings = await Scheduler.settings()
 
         mode = str(
-            settings.get("source_mode")
-            or "round_robin"
+            settings.get(
+                "source_mode",
+                "round_robin",
+            )
         ).lower()
 
-        # ========================================================
+        source_ids = sorted(
+            grouped.keys()
+        )
+
+        # ====================================================
         # SEQUENTIAL
-        # ========================================================
+        # ====================================================
 
         if mode == "sequential":
 
-            queue: list[dict[str, Any]] = []
+            queue: list[
+                dict[str, Any]
+            ] = []
 
-            for source_id in by_source:
+            for source_id in source_ids:
 
                 queue.extend(
-                    by_source[source_id]
+                    grouped[source_id]
                 )
 
             return queue
 
-        # ========================================================
+        # ====================================================
         # ROUND ROBIN
-        # ========================================================
+        # ====================================================
 
-        queues = list(
-            by_source.values()
-        )
+        result: list[
+            dict[str, Any]
+        ] = []
 
-        combined: list[dict[str, Any]] = []
+        position = 0
 
-        index = 0
+        while True:
 
-        while any(
-            index < len(queue)
-            for queue in queues
-        ):
+            added = False
 
-            for queue in queues:
+            for source_id in source_ids:
 
-                if index < len(queue):
+                source_posts = grouped[
+                    source_id
+                ]
 
-                    combined.append(
-                        queue[index]
+                if position < len(
+                    source_posts
+                ):
+
+                    result.append(
+                        source_posts[position]
                     )
 
-            index += 1
+                    added = True
 
-        return combined
+            if not added:
+                break
+
+            position += 1
+
+        return result
 
     # ============================================================
     # MAIN LOOP
@@ -515,13 +429,15 @@ class Scheduler:
             while True:
 
                 settings = (
-                    await Scheduler.get_effective_settings()
+                    await Scheduler.settings()
                 )
 
                 try:
 
-                    interval_minutes = float(
-                        settings["interval_minutes"]
+                    minutes = float(
+                        settings[
+                            "interval_minutes"
+                        ]
                     )
 
                 except (
@@ -529,76 +445,88 @@ class Scheduler:
                     ValueError,
                 ):
 
-                    interval_minutes = 10
+                    minutes = 10
 
-                if interval_minutes <= 0:
-                    interval_minutes = 1
+                if minutes <= 0:
+                    minutes = 1
 
                 interval = timedelta(
-                    minutes=interval_minutes
+                    minutes=minutes
                 )
 
-                # ------------------------------------------------
-                # Build queue
-                # ------------------------------------------------
-
-                queue = await Scheduler.build_queue()
+                queue = (
+                    await Scheduler.build_queue()
+                )
 
                 if not queue:
 
                     logger.warning(
-                        "[WARNING] No posts available; scheduler idling"
+                        "[WARNING] Queue empty. "
+                        "Check posts.json and routes."
                     )
 
                     await asyncio.sleep(
-                        min(
-                            interval.total_seconds(),
-                            60,
-                        )
+                        30
                     )
 
                     continue
 
-                # ------------------------------------------------
-                # Current scheduler state
-                # ------------------------------------------------
+                schedule = (
+                    await storage.get_schedule()
+                )
 
-                schedule = await storage.get_schedule()
+                try:
 
-                current_index = int(
-                    schedule.get(
-                        "current_index",
-                        0,
+                    index = int(
+                        schedule.get(
+                            "current_index",
+                            0,
+                        )
+                        or 0
                     )
-                    or 0
-                )
 
-                current_index %= len(queue)
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+
+                    index = 0
+
+                index %= len(queue)
 
                 # ------------------------------------------------
-                # Calculate next execution time
+                # Next execution
                 # ------------------------------------------------
-
-                next_run_iso = schedule.get(
-                    "next_run_iso"
-                )
 
                 now = datetime.now(
                     timezone.utc
+                )
+
+                next_run_iso = (
+                    schedule.get(
+                        "next_run_iso"
+                    )
                 )
 
                 if next_run_iso:
 
                     try:
 
-                        next_run = datetime.fromisoformat(
-                            next_run_iso
+                        next_run = (
+                            datetime.fromisoformat(
+                                next_run_iso
+                            )
                         )
 
-                        if next_run.tzinfo is None:
+                        if (
+                            next_run.tzinfo
+                            is None
+                        ):
 
-                            next_run = next_run.replace(
-                                tzinfo=timezone.utc
+                            next_run = (
+                                next_run.replace(
+                                    tzinfo=timezone.utc
+                                )
                             )
 
                     except (
@@ -612,65 +540,59 @@ class Scheduler:
 
                     next_run = now
 
-                # Do not burst-send missed posts.
-
                 if next_run < now:
 
                     next_run = now
 
-                wait_seconds = (
+                wait = (
                     next_run - now
                 ).total_seconds()
 
-                if wait_seconds > 0:
+                if wait > 0:
 
                     logger.info(
-                        "[INFO] Next post in %.1f seconds",
-                        wait_seconds,
+                        "[INFO] Waiting %.1f seconds",
+                        wait,
                     )
 
                     await asyncio.sleep(
-                        wait_seconds
+                        wait
                     )
 
                 # ------------------------------------------------
-                # Rebuild queue after waiting
+                # Rebuild queue before sending
                 # ------------------------------------------------
 
-                queue = await Scheduler.build_queue()
+                queue = (
+                    await Scheduler.build_queue()
+                )
 
                 if not queue:
                     continue
 
-                current_index %= len(queue)
+                index %= len(queue)
 
-                post = queue[
-                    current_index
-                ]
-
-                # ------------------------------------------------
-                # Distribute
-                # ------------------------------------------------
+                post = queue[index]
 
                 await self._distribute(
-                    post=post,
-                    post_number=current_index + 1,
-                    total=len(queue),
+                    post,
+                    index + 1,
+                    len(queue),
                 )
 
                 # ------------------------------------------------
-                # Save progress
+                # Advance
                 # ------------------------------------------------
 
-                schedule = await storage.get_schedule()
-
-                new_index = (
-                    current_index + 1
-                ) % len(queue)
+                schedule = (
+                    await storage.get_schedule()
+                )
 
                 schedule[
                     "current_index"
-                ] = new_index
+                ] = (
+                    index + 1
+                ) % len(queue)
 
                 schedule[
                     "last_completed_iso"
@@ -685,6 +607,10 @@ class Scheduler:
                     + interval
                 ).isoformat()
 
+                schedule[
+                    "running"
+                ] = True
+
                 await storage.save_schedule(
                     schedule
                 )
@@ -692,7 +618,7 @@ class Scheduler:
         except asyncio.CancelledError:
 
             logger.info(
-                "[INFO] Scheduler loop cancelled"
+                "[INFO] Scheduler cancelled"
             )
 
             raise
@@ -700,7 +626,7 @@ class Scheduler:
         except Exception as exc:
 
             logger.exception(
-                "[ERROR] Scheduler loop crashed: %s",
+                "[ERROR] Scheduler crashed: %s",
                 exc,
             )
 
@@ -723,7 +649,7 @@ class Scheduler:
                 )
 
     # ============================================================
-    # DISTRIBUTION
+    # DISTRIBUTE
     # ============================================================
 
     async def _distribute(
@@ -733,84 +659,76 @@ class Scheduler:
         total: int,
     ) -> None:
 
-        source_chat_id = post.get(
-            "source_chat_id"
-        )
-
-        if source_chat_id is None:
-
-            logger.error(
-                "[ERROR] Post has no source_chat_id"
-            )
-
-            return
+        # --------------------------------------------------------
+        # SOURCE
+        # --------------------------------------------------------
 
         try:
 
-            source_chat_id = int(
-                source_chat_id
+            source_id = int(
+                post["source_chat_id"]
             )
 
         except (
+            KeyError,
             TypeError,
             ValueError,
         ):
 
             logger.error(
                 "[ERROR] Invalid source_chat_id: %s",
-                source_chat_id,
+                post.get(
+                    "source_chat_id"
+                ),
             )
 
             return
 
         # --------------------------------------------------------
-        # CRITICAL:
-        # Get destinations ONLY for this source.
+        # STRICT ROUTE
         # --------------------------------------------------------
 
         destinations = (
-            await Scheduler.get_destinations_for_source(
-                source_chat_id
+            await Scheduler.destinations_for_source(
+                source_id
             )
         )
 
         if not destinations:
 
-            logger.warning(
-                "[WARNING] No destinations configured for source %s; "
-                "post %s skipped",
-                source_chat_id,
+            logger.error(
+                "[ERROR] NO ROUTE: source=%s | post=%s",
+                source_id,
                 post_number,
             )
 
             return
 
         # --------------------------------------------------------
-        # Extract message IDs
+        # MESSAGE IDs
         # --------------------------------------------------------
 
-        message_ids = post.get(
+        raw_ids = post.get(
             "message_ids",
             [],
         )
 
-        if not message_ids:
+        if not raw_ids:
 
-            message_id = post.get(
+            single_id = post.get(
                 "message_id"
             )
 
-            if message_id is not None:
+            if single_id is not None:
 
-                message_ids = [
-                    message_id
+                raw_ids = [
+                    single_id
                 ]
 
-        if not message_ids:
+        if not raw_ids:
 
             logger.error(
-                "[ERROR] Post %s has no message IDs",
-                post_number,
+                "[ERROR] Post has no message IDs"
             )
 
             return
@@ -818,8 +736,8 @@ class Scheduler:
         try:
 
             message_ids = [
-                int(mid)
-                for mid in message_ids
+                int(x)
+                for x in raw_ids
             ]
 
         except (
@@ -828,22 +746,26 @@ class Scheduler:
         ):
 
             logger.error(
-                "[ERROR] Invalid message IDs in post %s",
-                post_number,
+                "[ERROR] Invalid message IDs: %s",
+                raw_ids,
             )
 
             return
 
         # --------------------------------------------------------
-        # Determine album
+        # MEDIA GROUP
         # --------------------------------------------------------
 
         post_type = str(
-            post.get("type", "")
+            post.get(
+                "type",
+                "",
+            )
         ).lower()
 
         is_album = (
-            post_type in {
+            post_type
+            in {
                 "album",
                 "media_group",
                 "mediagroup",
@@ -851,24 +773,21 @@ class Scheduler:
             and len(message_ids) > 1
         )
 
-        # Some imported posts may not contain type.
-        # If multiple IDs are present, treat it as a media group.
         if len(message_ids) > 1:
 
             is_album = True
 
-        # --------------------------------------------------------
-        # Send to each destination
-        # --------------------------------------------------------
-
         logger.info(
-            "[INFO] Distributing post %s/%s | "
-            "source=%s | destinations=%s",
+            "[INFO] POST %s/%s | SOURCE %s | DESTINATIONS %s",
             post_number,
             total,
-            source_chat_id,
-            len(destinations),
+            source_id,
+            destinations,
         )
+
+        # --------------------------------------------------------
+        # COPY
+        # --------------------------------------------------------
 
         for destination_id in destinations:
 
@@ -880,7 +799,7 @@ class Scheduler:
                         await copy_media_group_with_retry(
                             self.bot,
                             destination_id,
-                            source_chat_id,
+                            source_id,
                             message_ids,
                         )
                     )
@@ -891,7 +810,7 @@ class Scheduler:
                         await copy_message_with_retry(
                             self.bot,
                             destination_id,
-                            source_chat_id,
+                            source_id,
                             message_ids[0],
                         )
                     )
@@ -905,29 +824,21 @@ class Scheduler:
                 ok = False
                 error = str(exc)
 
-            # ----------------------------------------------------
-            # Logging
-            # ----------------------------------------------------
-
             if ok:
 
                 logger.info(
-                    "[SUCCESS] Post %s/%s copied: "
-                    "%s -> %s",
-                    post_number,
-                    total,
-                    source_chat_id,
+                    "[SUCCESS] %s -> %s | post=%s",
+                    source_id,
                     destination_id,
+                    post_number,
                 )
 
             else:
 
                 logger.error(
-                    "[ERROR] Failed to copy post %s/%s: "
-                    "%s -> %s | %s",
-                    post_number,
-                    total,
-                    source_chat_id,
+                    "[ERROR] %s -> %s | post=%s | %s",
+                    source_id,
                     destination_id,
+                    post_number,
                     error,
-              )
+            )
