@@ -1,20 +1,7 @@
 """
 bot.py
-Render + Termux compatible Telegram Forwarder Bot
 
-Features:
-- Aiogram 3.x polling
-- Render $PORT health server
-- /health endpoint
-- Automatic Telegram retry
-- Channel post updates enabled
-- Source channel verification
-- Destination channel verification
-- Route-aware scheduler
-- Scheduler resume
-- Safe shutdown
-- Dispatcher created only once
-- Handlers registered only once
+Render + Termux compatible Telegram forwarding bot.
 """
 
 from __future__ import annotations
@@ -22,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from contextlib import suppress
 
 from aiohttp import web
 
@@ -38,7 +24,6 @@ import storage
 from config import CONFIG
 from handlers import register_handlers
 from scheduler import Scheduler
-from telegram_utils import verify_chat_access
 
 
 # ============================================================
@@ -47,52 +32,70 @@ from telegram_utils import verify_chat_access
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format=(
+        "%(asctime)s "
+        "%(levelname)s "
+        "%(name)s "
+        "%(message)s"
+    ),
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-logger = logging.getLogger("forwarder")
+logger = logging.getLogger(
+    "forwarder"
+)
 
 
 # ============================================================
 # HEALTH SERVER
 # ============================================================
 
-async def health_handler(request: web.Request) -> web.Response:
-    return web.json_response(
-        {
-            "status": "ok",
-            "service": "telegram-bot",
-            "message": "Bot is running",
-        }
-    )
+async def root_handler(
+    request: web.Request,
+) -> web.Response:
 
-
-async def root_handler(request: web.Request) -> web.Response:
     return web.Response(
-        text="Telegram Forwarder Bot is running.",
+        text="Forwarder-ROBOT is running.",
         content_type="text/plain",
     )
 
 
-async def start_health_server() -> web.AppRunner:
-    """
-    Render requires the application to listen on $PORT.
-    """
+async def health_handler(
+    request: web.Request,
+) -> web.Response:
 
-    raw_port = os.getenv("PORT", "10000")
+    return web.json_response(
+        {
+            "status": "ok",
+            "service": "Forwarder-ROBOT",
+        }
+    )
 
-    try:
-        port = int(raw_port)
-    except ValueError:
-        port = 10000
+
+async def start_health_server():
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000",
+        )
+    )
 
     app = web.Application()
 
-    app.router.add_get("/", root_handler)
-    app.router.add_get("/health", health_handler)
+    app.router.add_get(
+        "/",
+        root_handler,
+    )
 
-    runner = web.AppRunner(app)
+    app.router.add_get(
+        "/health",
+        health_handler,
+    )
+
+    runner = web.AppRunner(
+        app
+    )
 
     await runner.setup()
 
@@ -105,7 +108,7 @@ async def start_health_server() -> web.AppRunner:
     await site.start()
 
     logger.info(
-        "[RENDER] Health server listening on 0.0.0.0:%s",
+        "HTTP health server running on port %s",
         port,
     )
 
@@ -113,345 +116,207 @@ async def start_health_server() -> web.AppRunner:
 
 
 # ============================================================
-# SAFE INTEGER
+# VERIFY CHANNEL
 # ============================================================
 
-def safe_int(value, default=None):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-# ============================================================
-# STARTUP CHECKS
-# ============================================================
-
-async def startup_checks(bot: Bot) -> bool:
-    """
-    Check Telegram authentication and configured channels.
-
-    IMPORTANT:
-    A temporary verification failure must NOT permanently
-    disable the source in storage.
-    """
-
-    logger.info("[INFO] Bot starting...")
-
-    # ========================================================
-    # BOT AUTHENTICATION
-    # ========================================================
-
-    try:
-        me = await bot.get_me()
-
-    except TelegramUnauthorizedError:
-        logger.error(
-            "[FATAL] BOT_TOKEN is invalid or revoked."
-        )
-        return False
-
-    except (
-        TelegramNetworkError,
-        TimeoutError,
-        asyncio.TimeoutError,
-        ConnectionError,
-    ) as exc:
-        logger.error(
-            "[NETWORK] Telegram authentication failed: %s",
-            exc,
-        )
-        return False
-
-    except Exception as exc:
-        logger.exception(
-            "[ERROR] Telegram authentication failed: %s",
-            exc,
-        )
-        return False
-
-    logger.info(
-        "[SUCCESS] Authenticated as @%s | ID=%s",
-        me.username or "unknown",
-        me.id,
-    )
+async def verify_configured_channels(
+    bot: Bot,
+) -> None:
 
     # ========================================================
     # SOURCES
     # ========================================================
 
-    try:
-        sources = await storage.get_sources()
-    except Exception as exc:
-        logger.exception(
-            "[ERROR] Cannot load sources: %s",
-            exc,
-        )
-        sources = []
+    sources = await storage.get_sources()
 
     enabled_sources = 0
 
     for source in sources:
 
-        chat_id = safe_int(
-            source.get("chat_id")
-        )
+        try:
 
-        if chat_id is None:
-            logger.warning(
-                "[WARNING] Invalid source entry: %s",
-                source,
+            chat_id = int(
+                source["chat_id"]
             )
+
+        except Exception:
+
+            source["enabled"] = False
+
             continue
 
         try:
 
-            result = await verify_chat_access(
-                bot,
+            chat = await bot.get_chat(
+                chat_id
+            )
+
+            source["enabled"] = True
+
+            source["title"] = (
+                chat.title
+                or source.get(
+                    "title",
+                    str(chat_id),
+                )
+            )
+
+            source["username"] = (
+                chat.username
+            )
+
+            enabled_sources += 1
+
+            logger.info(
+                "Source verified: %s (%s)",
+                source["title"],
                 chat_id,
             )
 
-            if result.ok:
-
-                # Keep source enabled.
-                source["enabled"] = True
-
-                source["chat_id"] = chat_id
-
-                if result.title:
-                    source["title"] = result.title
-
-                if result.username:
-                    source["username"] = result.username
-
-                enabled_sources += 1
-
-                logger.info(
-                    "[SOURCE OK] %s | %s",
-                    result.title or "Unknown",
-                    chat_id,
-                )
-
-            else:
-
-                # IMPORTANT:
-                # Do not permanently disable it.
-                #
-                # If Telegram temporarily fails, the source
-                # must remain configured.
-
-                logger.warning(
-                    "[SOURCE CHECK WARNING] %s | %s",
-                    chat_id,
-                    result.error,
-                )
-
-                if "enabled" not in source:
-                    source["enabled"] = True
-
         except Exception as exc:
 
+            # IMPORTANT:
+            # Do NOT delete source.
+            # Keep configuration even if temporary
+            # Telegram failure occurs.
+            source["enabled"] = False
+
             logger.warning(
-                "[SOURCE CHECK ERROR] %s | %s",
+                "Source verification failed %s: %s",
                 chat_id,
                 exc,
             )
 
-            if "enabled" not in source:
-                source["enabled"] = True
-
-    # Save metadata, but don't delete sources.
-    try:
-        await storage.save_sources(sources)
-    except Exception as exc:
-        logger.warning(
-            "[WARNING] Could not save source metadata: %s",
-            exc,
-        )
-
-    logger.info(
-        "[INFO] Source channels configured: %s | verified: %s",
-        len(sources),
-        enabled_sources,
+    await storage.save_sources(
+        sources
     )
 
     # ========================================================
     # DESTINATIONS
     # ========================================================
 
-    try:
-        channels = await storage.get_channels()
-    except Exception as exc:
-        logger.exception(
-            "[ERROR] Cannot load destination channels: %s",
-            exc,
-        )
-        channels = []
+    channels = await storage.get_channels()
 
-    verified_destinations = 0
+    enabled_channels = 0
 
     for channel in channels:
 
-        chat_id = safe_int(
-            channel.get("chat_id")
-        )
+        try:
 
-        if chat_id is None:
-            logger.warning(
-                "[WARNING] Invalid destination entry: %s",
-                channel,
+            chat_id = int(
+                channel["chat_id"]
             )
+
+        except Exception:
+
+            channel["enabled"] = False
+
             continue
 
         try:
 
-            result = await verify_chat_access(
-                bot,
+            chat = await bot.get_chat(
+                chat_id
+            )
+
+            channel["enabled"] = True
+
+            channel["title"] = (
+                chat.title
+                or channel.get(
+                    "title",
+                    str(chat_id),
+                )
+            )
+
+            channel["username"] = (
+                chat.username
+            )
+
+            enabled_channels += 1
+
+            logger.info(
+                "Destination verified: %s (%s)",
+                channel["title"],
                 chat_id,
             )
 
-            if result.ok:
-
-                channel["enabled"] = True
-                channel["chat_id"] = chat_id
-
-                if result.title:
-                    channel["title"] = result.title
-
-                if result.username:
-                    channel["username"] = result.username
-
-                verified_destinations += 1
-
-                logger.info(
-                    "[DESTINATION OK] %s | %s",
-                    result.title or "Unknown",
-                    chat_id,
-                )
-
-            else:
-
-                logger.warning(
-                    "[DESTINATION CHECK WARNING] %s | %s",
-                    chat_id,
-                    result.error,
-                )
-
-                if "enabled" not in channel:
-                    channel["enabled"] = True
-
         except Exception as exc:
 
+            channel["enabled"] = False
+
             logger.warning(
-                "[DESTINATION CHECK ERROR] %s | %s",
+                "Destination verification failed %s: %s",
                 chat_id,
                 exc,
             )
 
-            if "enabled" not in channel:
-                channel["enabled"] = True
-
-    try:
-        await storage.save_channels(channels)
-    except Exception as exc:
-        logger.warning(
-            "[WARNING] Could not save destination metadata: %s",
-            exc,
-        )
-
-    logger.info(
-        "[INFO] Destination channels configured: %s | verified: %s",
-        len(channels),
-        verified_destinations,
+    await storage.save_channels(
+        channels
     )
 
-    # ========================================================
-    # ROUTES
-    # ========================================================
+    logger.info(
+        "Channels: sources=%s/%s destinations=%s/%s",
+        enabled_sources,
+        len(sources),
+        enabled_channels,
+        len(channels),
+    )
+
+
+# ============================================================
+# TELEGRAM AUTH
+# ============================================================
+
+async def authenticate(
+    bot: Bot,
+) -> bool:
 
     try:
 
-        if hasattr(storage, "get_routes"):
+        me = await bot.get_me()
 
-            routes = await storage.get_routes()
+        logger.info(
+            "Authenticated as @%s (id=%s)",
+            me.username or "unknown",
+            me.id,
+        )
 
-            logger.info(
-                "[INFO] Routes configured: %s",
-                len(routes),
-            )
+        return True
 
-            for route in routes:
+    except TelegramUnauthorizedError:
 
-                source_id = safe_int(
-                    route.get("source_id")
-                )
+        logger.error(
+            "BOT_TOKEN is invalid or revoked."
+        )
 
-                destinations = route.get(
-                    "destinations",
-                    [],
-                )
+        return False
 
-                logger.info(
-                    "[ROUTE] %s -> %s",
-                    source_id,
-                    destinations,
-                )
+    except (
+        TelegramNetworkError,
+        asyncio.TimeoutError,
+        TimeoutError,
+    ) as exc:
 
-    except Exception as exc:
-
-        logger.warning(
-            "[WARNING] Could not load routes: %s",
+        logger.error(
+            "Telegram network error: %s",
             exc,
         )
 
-    # ========================================================
-    # POSTS
-    # ========================================================
-
-    try:
-
-        posts = await storage.get_posts()
-
-        logger.info(
-            "[INFO] Posts loaded: %s",
-            len(posts),
-        )
-
-        # Show source distribution.
-        source_counter: dict[int, int] = {}
-
-        for post in posts:
-
-            source_id = safe_int(
-                post.get("source_chat_id")
-            )
-
-            if source_id is not None:
-
-                source_counter[source_id] = (
-                    source_counter.get(source_id, 0) + 1
-                )
-
-        for source_id, count in source_counter.items():
-
-            logger.info(
-                "[POSTS] Source %s -> %s post(s)",
-                source_id,
-                count,
-            )
+        return False
 
     except Exception as exc:
 
         logger.exception(
-            "[ERROR] Could not load posts: %s",
+            "Authentication failed: %s",
             exc,
         )
 
-    return True
+        return False
 
 
 # ============================================================
-# RUN BOT
+# RUN ONE SESSION
 # ============================================================
 
 async def run_bot(
@@ -460,97 +325,71 @@ async def run_bot(
     scheduler: Scheduler,
 ) -> None:
 
-    # ========================================================
-    # STARTUP CHECK
-    # ========================================================
-
-    authenticated = await startup_checks(
+    authenticated = await authenticate(
         bot
     )
 
     if not authenticated:
+
         raise RuntimeError(
             "Telegram authentication failed."
         )
 
-    # ========================================================
-    # REGISTER HANDLERS
-    # ========================================================
+    # Verify configured channels.
+    await verify_configured_channels(
+        bot
+    )
 
-    #
-    # IMPORTANT:
-    #
-    # handlers.py must contain:
-    #
-    # def register_handlers(dp, bot, scheduler):
-    #
-    # and it must protect against duplicate router attachment.
-    #
+    # --------------------------------------------------------
+    # Register handlers ONLY ONCE
+    # --------------------------------------------------------
 
-    register_handlers(
+    if not getattr(
         dp,
-        bot,
-        scheduler,
-    )
+        "_forwarder_registered",
+        False,
+    ):
 
-    logger.info(
-        "[SUCCESS] Handlers registered."
-    )
+        register_handlers(
+            dp,
+            bot,
+            scheduler,
+        )
 
-    # ========================================================
-    # SCHEDULER RESUME
-    # ========================================================
+        dp._forwarder_registered = True
+
+        logger.info(
+            "Handlers registered."
+        )
+
+    # --------------------------------------------------------
+    # Resume scheduler
+    # --------------------------------------------------------
 
     try:
 
         await scheduler.resume_if_needed()
 
-        logger.info(
-            "[INFO] Scheduler resume check complete."
-        )
-
     except Exception as exc:
 
         logger.exception(
-            "[ERROR] Scheduler resume failed: %s",
+            "Scheduler resume failed: %s",
             exc,
         )
 
-    # ========================================================
-    # POLLING
-    # ========================================================
+    # --------------------------------------------------------
+    # Polling
+    # --------------------------------------------------------
 
     logger.info(
-        "[INFO] Telegram polling started."
+        "Telegram polling started."
     )
-
-    logger.info(
-        "[INFO] Listening for channel posts..."
-    )
-
-    #
-    # Explicit allowed_updates is important for the
-    # source-channel listener.
-    #
-
-    allowed_updates = [
-        "message",
-        "edited_message",
-        "channel_post",
-        "edited_channel_post",
-        "callback_query",
-    ]
 
     await dp.start_polling(
         bot,
-
         polling_timeout=30,
-
         handle_as_tasks=True,
-
         close_bot_session=False,
-
-        allowed_updates=allowed_updates,
     )
 
 
@@ -560,15 +399,9 @@ async def run_bot(
 
 async def main() -> None:
 
-    # ========================================================
-    # HEALTH SERVER
-    # ========================================================
-
-    health_runner = await start_health_server()
-
-    # ========================================================
-    # BOT
-    # ========================================================
+    health_runner = (
+        await start_health_server()
+    )
 
     bot = Bot(
         token=CONFIG.bot_token,
@@ -577,29 +410,11 @@ async def main() -> None:
         ),
     )
 
-    # ========================================================
-    # DISPATCHER
-    # ========================================================
-
-    #
-    # Create Dispatcher ONLY ONCE.
-    #
-    # Do NOT recreate it inside retry loop.
-    #
-
     dp = Dispatcher()
-
-    # ========================================================
-    # SCHEDULER
-    # ========================================================
 
     scheduler = Scheduler(
         bot
     )
-
-    # ========================================================
-    # RETRY SETTINGS
-    # ========================================================
 
     retry_delay = 10
 
@@ -609,98 +424,60 @@ async def main() -> None:
 
             try:
 
-                logger.info(
-                    "[INFO] Starting bot worker..."
-                )
-
                 await run_bot(
                     bot,
                     dp,
                     scheduler,
                 )
 
-                #
-                # Polling exited without exception.
-                #
-
                 logger.warning(
-                    "[WARNING] Telegram polling stopped."
+                    "Polling stopped."
                 )
 
                 await asyncio.sleep(
                     retry_delay
                 )
-
-            # =================================================
-            # INVALID TOKEN
-            # =================================================
 
             except TelegramUnauthorizedError:
 
                 logger.error(
-                    "[FATAL] Telegram token is invalid/revoked."
+                    "BOT_TOKEN invalid/revoked. "
+                    "Stopping permanently."
                 )
 
                 break
 
-            # =================================================
-            # NETWORK ERROR
-            # =================================================
-
             except (
                 TelegramNetworkError,
-                TimeoutError,
                 asyncio.TimeoutError,
+                TimeoutError,
                 ConnectionError,
             ) as exc:
 
                 logger.error(
-                    "[NETWORK] Connection error: %s",
+                    "Network failure: %s",
                     exc,
-                )
-
-                logger.info(
-                    "[RESTART] Retrying in %s seconds...",
-                    retry_delay,
                 )
 
                 await asyncio.sleep(
                     retry_delay
                 )
 
-            # =================================================
-            # CANCELLED
-            # =================================================
-
             except asyncio.CancelledError:
 
-                logger.info(
-                    "[INFO] Main task cancelled."
-                )
-
                 raise
-
-            # =================================================
-            # OTHER ERROR
-            # =================================================
 
             except Exception as exc:
 
                 logger.exception(
-                    "[ERROR] Bot crashed: %s",
+                    "Bot crashed: %s",
                     exc,
                 )
 
                 logger.info(
-                    "[RESTART] Restarting in %s seconds...",
+                    "Restarting in %s seconds...",
                     retry_delay,
                 )
-
-                #
-                # IMPORTANT:
-                # Don't create a second Dispatcher.
-                # Don't create another Scheduler.
-                #
 
                 await asyncio.sleep(
                     retry_delay
@@ -709,12 +486,8 @@ async def main() -> None:
     finally:
 
         logger.info(
-            "[INFO] Shutting down..."
+            "Shutting down..."
         )
-
-        # ====================================================
-        # STOP SCHEDULER
-        # ====================================================
 
         try:
 
@@ -725,21 +498,9 @@ async def main() -> None:
         except Exception as exc:
 
             logger.warning(
-                "[WARNING] Scheduler shutdown error: %s",
+                "Scheduler shutdown error: %s",
                 exc,
             )
-
-        # ====================================================
-        # STOP POLLING
-        # ====================================================
-
-        with suppress(Exception):
-
-            await dp.stop_polling()
-
-        # ====================================================
-        # CLOSE BOT SESSION
-        # ====================================================
 
         try:
 
@@ -748,13 +509,9 @@ async def main() -> None:
         except Exception as exc:
 
             logger.warning(
-                "[WARNING] Bot session close error: %s",
+                "Bot session close error: %s",
                 exc,
             )
-
-        # ====================================================
-        # CLOSE HEALTH SERVER
-        # ====================================================
 
         try:
 
@@ -763,17 +520,17 @@ async def main() -> None:
         except Exception as exc:
 
             logger.warning(
-                "[WARNING] Health server cleanup error: %s",
+                "Health server cleanup error: %s",
                 exc,
             )
 
         logger.info(
-            "[INFO] Shutdown complete."
+            "Shutdown complete."
         )
 
 
 # ============================================================
-# ENTRY POINT
+# ENTRY
 # ============================================================
 
 if __name__ == "__main__":
@@ -787,18 +544,14 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         print(
-            "\n[INFO] Bot stopped by user."
-        )
-
-    except asyncio.CancelledError:
-
-        print(
-            "\n[INFO] Bot cancelled."
+            "\nBot stopped by user."
         )
 
     except Exception as exc:
 
-        logging.getLogger("forwarder").exception(
-            "[FATAL] Application stopped: %s",
+        logging.getLogger(
+            "forwarder"
+        ).exception(
+            "Fatal error: %s",
             exc,
-                )
+    )
