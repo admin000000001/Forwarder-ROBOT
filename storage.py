@@ -1,237 +1,116 @@
-"""
-storage.py
-
-JSON persistence for Forwarder-ROBOT.
-
-Files:
-    data/sources.json
-    data/channels.json
-    data/routes.json
-    data/posts.json
-    data/schedule.json
-    data/settings.json
-"""
-
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
-import tempfile
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+logger = logging.getLogger("forwarder")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
 CHANNELS_FILE = os.path.join(DATA_DIR, "channels.json")
-ROUTES_FILE = os.path.join(DATA_DIR, "routes.json")
 POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
-SCHEDULE_FILE = os.path.join(DATA_DIR, "schedule.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
-
-
-DEFAULTS = {
-    SOURCES_FILE: {
-        "sources": []
-    },
-
-    CHANNELS_FILE: {
-        "channels": []
-    },
-
-    ROUTES_FILE: {
-        "routes": []
-    },
-
-    POSTS_FILE: {
-        "posts": []
-    },
-
-    SCHEDULE_FILE: {
-        "current_index": 0,
-        "running": False,
-        "next_run_iso": None,
-        "last_completed_iso": None,
-    },
-
-    SETTINGS_FILE: {
-        "interval_minutes": None,
-        "source_mode": None,
-        "missed_schedule_policy": None,
-        "auto_queue_new_posts": True,
-        "total_posts": None,
-    },
-}
-
+SCHEDULE_FILE = os.path.join(DATA_DIR, "schedule.json")
 
 _LOCK = asyncio.Lock()
 
 
 # ============================================================
-# BASIC FILE HELPERS
+# DIRECTORY
 # ============================================================
 
 def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def _clone(value: Any) -> Any:
-    return json.loads(json.dumps(value))
+# ============================================================
+# DEFAULTS
+# ============================================================
+
+DEFAULT_SETTINGS = {
+    "interval_minutes": 10,
+    "source_mode": "round_robin",
+    "missed_schedule_policy": "next",
+    "total_posts": 0,
+    "routes": [],
+}
 
 
-def _atomic_write(path: str, data: dict[str, Any]) -> None:
-    _ensure_data_dir()
-
-    directory = os.path.dirname(path)
-
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".tmp_",
-        dir=directory,
-    )
-
-    try:
-        with os.fdopen(
-            fd,
-            "w",
-            encoding="utf-8",
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-            file.flush()
-            os.fsync(file.fileno())
-
-        os.replace(
-            tmp_path,
-            path,
-        )
-
-    except Exception:
-
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
-
-        raise
+DEFAULT_SCHEDULE = {
+    "running": False,
+    "current_index": 0,
+    "next_run_iso": None,
+    "last_completed_iso": None,
+}
 
 
-def _read_raw(path: str) -> dict[str, Any]:
+# ============================================================
+# JSON HELPERS
+# ============================================================
+
+def _read_json_sync(path: str, default: Any) -> Any:
     _ensure_data_dir()
 
     if not os.path.exists(path):
-
-        default = _clone(DEFAULTS[path])
-
-        _atomic_write(
-            path,
-            default,
-        )
-
         return default
 
     try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-        with open(
+    except Exception as exc:
+        logger.error(
+            "[STORAGE] Failed reading %s: %s",
             path,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
-            content = file.read().strip()
-
-        if not content:
-            raise ValueError("empty JSON file")
-
-        data = json.loads(content)
-
-        if not isinstance(data, dict):
-            raise ValueError(
-                "JSON root must be an object"
-            )
-
-        return data
-
-    except (
-        json.JSONDecodeError,
-        ValueError,
-    ) as exc:
-
-        print(
-            f"[WARNING] Corrupt JSON: {path}: {exc}"
-        )
-
-        backup = path + ".corrupt"
-
-        try:
-            if os.path.exists(path):
-                os.replace(
-                    path,
-                    backup,
-                )
-        except OSError:
-            pass
-
-        default = _clone(
-            DEFAULTS[path]
-        )
-
-        _atomic_write(
-            path,
-            default,
+            exc,
         )
 
         return default
 
 
-async def read_json(
-    path: str,
-) -> dict[str, Any]:
+def _write_json_sync(path: str, data: Any) -> None:
+    _ensure_data_dir()
 
+    temp = path + ".tmp"
+
+    with open(
+        temp,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(temp, path)
+
+
+async def _read(path: str, default: Any) -> Any:
     async with _LOCK:
-
         return await asyncio.to_thread(
-            _read_raw,
+            _read_json_sync,
             path,
+            default,
         )
 
 
-async def write_json(
-    path: str,
-    data: dict[str, Any],
-) -> None:
-
+async def _write(path: str, data: Any) -> None:
     async with _LOCK:
-
         await asyncio.to_thread(
-            _atomic_write,
+            _write_json_sync,
             path,
             data,
         )
-
-
-# ============================================================
-# GENERAL
-# ============================================================
-
-def now_iso() -> str:
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-def new_uid() -> str:
-    return uuid.uuid4().hex
 
 
 # ============================================================
@@ -239,33 +118,119 @@ def new_uid() -> str:
 # ============================================================
 
 async def get_sources() -> list[dict[str, Any]]:
-
-    data = await read_json(
-        SOURCES_FILE
-    )
-
-    sources = data.get(
-        "sources",
+    data = await _read(
+        SOURCES_FILE,
         [],
     )
 
-    return (
-        sources
-        if isinstance(sources, list)
-        else []
-    )
+    if not isinstance(data, list):
+        return []
+
+    return data
 
 
 async def save_sources(
     sources: list[dict[str, Any]],
 ) -> None:
 
-    await write_json(
+    clean: list[dict[str, Any]] = []
+
+    seen: set[int] = set()
+
+    for source in sources:
+
+        try:
+            chat_id = int(
+                source.get("chat_id")
+            )
+        except Exception:
+            continue
+
+        if chat_id in seen:
+            continue
+
+        seen.add(chat_id)
+
+        clean.append(
+            {
+                "chat_id": chat_id,
+                "title": source.get(
+                    "title",
+                    "Unknown",
+                ),
+                "username": source.get(
+                    "username"
+                ),
+                "enabled": bool(
+                    source.get(
+                        "enabled",
+                        True,
+                    )
+                ),
+            }
+        )
+
+    await _write(
         SOURCES_FILE,
-        {
-            "sources": sources
-        },
+        clean,
     )
+
+
+async def add_source(
+    chat_id: int,
+    title: str | None = None,
+    username: str | None = None,
+) -> bool:
+
+    sources = await get_sources()
+
+    for source in sources:
+        try:
+            if int(source["chat_id"]) == int(chat_id):
+                return False
+        except Exception:
+            continue
+
+    sources.append(
+        {
+            "chat_id": int(chat_id),
+            "title": title or "Unknown",
+            "username": username,
+            "enabled": True,
+        }
+    )
+
+    await save_sources(sources)
+
+    return True
+
+
+async def remove_source(
+    chat_id: int,
+) -> bool:
+
+    sources = await get_sources()
+
+    new_sources = []
+
+    removed = False
+
+    for source in sources:
+
+        try:
+            sid = int(source["chat_id"])
+        except Exception:
+            continue
+
+        if sid == int(chat_id):
+            removed = True
+            continue
+
+        new_sources.append(source)
+
+    await save_sources(new_sources)
+
+    return removed
 
 
 # ============================================================
@@ -273,32 +238,277 @@ async def save_sources(
 # ============================================================
 
 async def get_channels() -> list[dict[str, Any]]:
-
-    data = await read_json(
-        CHANNELS_FILE
-    )
-
-    channels = data.get(
-        "channels",
+    data = await _read(
+        CHANNELS_FILE,
         [],
     )
 
-    return (
-        channels
-        if isinstance(channels, list)
-        else []
-    )
+    if not isinstance(data, list):
+        return []
+
+    return data
 
 
 async def save_channels(
     channels: list[dict[str, Any]],
 ) -> None:
 
-    await write_json(
+    clean: list[dict[str, Any]] = []
+
+    seen: set[int] = set()
+
+    for channel in channels:
+
+        try:
+            chat_id = int(
+                channel.get("chat_id")
+            )
+        except Exception:
+            continue
+
+        if chat_id in seen:
+            continue
+
+        seen.add(chat_id)
+
+        clean.append(
+            {
+                "chat_id": chat_id,
+                "title": channel.get(
+                    "title",
+                    "Unknown",
+                ),
+                "username": channel.get(
+                    "username"
+                ),
+                "enabled": bool(
+                    channel.get(
+                        "enabled",
+                        True,
+                    )
+                ),
+            }
+        )
+
+    await _write(
         CHANNELS_FILE,
+        clean,
+    )
+
+
+async def add_channel(
+    chat_id: int,
+    title: str | None = None,
+    username: str | None = None,
+) -> bool:
+
+    channels = await get_channels()
+
+    for channel in channels:
+
+        try:
+            if int(channel["chat_id"]) == int(chat_id):
+                return False
+        except Exception:
+            continue
+
+    channels.append(
         {
-            "channels": channels
-        },
+            "chat_id": int(chat_id),
+            "title": title or "Unknown",
+            "username": username,
+            "enabled": True,
+        }
+    )
+
+    await save_channels(channels)
+
+    return True
+
+
+async def remove_channel(
+    chat_id: int,
+) -> bool:
+
+    channels = await get_channels()
+
+    new_channels = []
+
+    removed = False
+
+    for channel in channels:
+
+        try:
+            cid = int(channel["chat_id"])
+        except Exception:
+            continue
+
+        if cid == int(chat_id):
+            removed = True
+            continue
+
+        new_channels.append(channel)
+
+    await save_channels(new_channels)
+
+    return removed
+
+
+# ============================================================
+# POSTS
+# ============================================================
+
+async def get_posts() -> list[dict[str, Any]]:
+    data = await _read(
+        POSTS_FILE,
+        [],
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    return data
+
+
+async def save_posts(
+    posts: list[dict[str, Any]],
+) -> None:
+
+    await _write(
+        POSTS_FILE,
+        posts,
+    )
+
+
+async def add_post(
+    post: dict[str, Any],
+) -> bool:
+    """
+    Add one post.
+
+    Duplicate detection:
+        source_chat_id + message_ids
+    """
+
+    posts = await get_posts()
+
+    source_id = post.get(
+        "source_chat_id"
+    )
+
+    message_ids = post.get(
+        "message_ids",
+        [],
+    )
+
+    if not message_ids:
+
+        message_id = post.get(
+            "message_id"
+        )
+
+        if message_id is not None:
+            message_ids = [
+                message_id
+            ]
+
+    try:
+        source_id = int(source_id)
+        message_ids = [
+            int(x)
+            for x in message_ids
+        ]
+    except Exception:
+        return False
+
+    if not message_ids:
+        return False
+
+    # --------------------------------------------------------
+    # Duplicate check
+    # --------------------------------------------------------
+
+    for existing in posts:
+
+        try:
+            existing_source = int(
+                existing.get(
+                    "source_chat_id"
+                )
+            )
+
+            existing_ids = [
+                int(x)
+                for x in existing.get(
+                    "message_ids",
+                    [],
+                )
+            ]
+
+        except Exception:
+            continue
+
+        if (
+            existing_source == source_id
+            and existing_ids == message_ids
+        ):
+            return False
+
+    post["source_chat_id"] = source_id
+    post["message_ids"] = message_ids
+
+    if "created_at" not in post:
+        post["created_at"] = now_iso()
+
+    posts.append(post)
+
+    await save_posts(posts)
+
+    return True
+
+
+async def clear_posts() -> None:
+    await save_posts([])
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+async def get_settings() -> dict[str, Any]:
+
+    data = await _read(
+        SETTINGS_FILE,
+        {},
+    )
+
+    if not isinstance(data, dict):
+        data = {}
+
+    result = dict(DEFAULT_SETTINGS)
+
+    result.update(data)
+
+    if not isinstance(
+        result.get("routes"),
+        list,
+    ):
+        result["routes"] = []
+
+    return result
+
+
+async def save_settings(
+    settings: dict[str, Any],
+) -> None:
+
+    current = dict(DEFAULT_SETTINGS)
+
+    current.update(settings)
+
+    await _write(
+        SETTINGS_FILE,
+        current,
     )
 
 
@@ -307,34 +517,10 @@ async def save_channels(
 # ============================================================
 
 async def get_routes() -> list[dict[str, Any]]:
-    """
-    Return ONLY explicitly configured routes.
 
-    Example:
+    settings = await get_settings()
 
-    [
-        {
-            "source_id": -100111,
-            "destinations": [
-                -100211,
-                -100212
-            ]
-        },
-        {
-            "source_id": -100112,
-            "destinations": [
-                -100221,
-                -100222
-            ]
-        }
-    ]
-    """
-
-    data = await read_json(
-        ROUTES_FILE
-    )
-
-    routes = data.get(
+    routes = settings.get(
         "routes",
         [],
     )
@@ -342,214 +528,93 @@ async def get_routes() -> list[dict[str, Any]]:
     if not isinstance(routes, list):
         return []
 
-    cleaned: list[dict[str, Any]] = []
+    clean: list[dict[str, Any]] = []
 
     for route in routes:
 
-        if not isinstance(
-            route,
-            dict,
-        ):
+        if not isinstance(route, dict):
             continue
 
         try:
             source_id = int(
                 route.get("source_id")
             )
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except Exception:
             continue
 
         destinations = []
 
-        raw_destinations = route.get(
+        for destination in route.get(
             "destinations",
             [],
-        )
-
-        if not isinstance(
-            raw_destinations,
-            list,
         ):
-            raw_destinations = []
-
-        for destination in raw_destinations:
 
             try:
-
-                destination_id = int(
-                    destination
+                destinations.append(
+                    int(destination)
                 )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
+            except Exception:
                 continue
 
-            if destination_id not in destinations:
-
-                destinations.append(
-                    destination_id
-                )
-
-        cleaned.append(
+        clean.append(
             {
                 "source_id": source_id,
-                "destinations": destinations,
+                "destinations": list(
+                    dict.fromkeys(
+                        destinations
+                    )
+                ),
             }
         )
 
-    return cleaned
+    return clean
 
 
 async def save_routes(
     routes: list[dict[str, Any]],
 ) -> None:
 
-    cleaned: list[dict[str, Any]] = []
+    settings = await get_settings()
+
+    clean: list[dict[str, Any]] = []
 
     for route in routes:
 
-        if not isinstance(
-            route,
-            dict,
-        ):
-            continue
-
         try:
-
             source_id = int(
                 route.get("source_id")
             )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except Exception:
             continue
 
-        destinations: list[int] = []
+        destinations = []
 
-        raw = route.get(
-            "destinations",
-            [],
-        )
-
-        if not isinstance(
-            raw,
-            list,
-        ):
-            raw = []
-
-        for destination in raw:
-
-            try:
-
-                destination_id = int(
-                    destination
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
-
-            if destination_id not in destinations:
-
-                destinations.append(
-                    destination_id
-                )
-
-        cleaned.append(
-            {
-                "source_id": source_id,
-                "destinations": destinations,
-            }
-        )
-
-    await write_json(
-        ROUTES_FILE,
-        {
-            "routes": cleaned
-        },
-    )
-
-
-async def get_route(
-    source_id: int,
-) -> dict[str, Any] | None:
-
-    source_id = int(source_id)
-
-    routes = await get_routes()
-
-    for route in routes:
-
-        if int(
-            route["source_id"]
-        ) == source_id:
-
-            return route
-
-    return None
-
-
-async def get_destinations_for_source(
-    source_id: int,
-) -> list[int]:
-
-    route = await get_route(
-        source_id
-    )
-
-    if not route:
-        return []
-
-    return [
-        int(destination)
         for destination in route.get(
             "destinations",
             [],
+        ):
+
+            try:
+                destinations.append(
+                    int(destination)
+                )
+            except Exception:
+                continue
+
+        clean.append(
+            {
+                "source_id": source_id,
+                "destinations": list(
+                    dict.fromkeys(
+                        destinations
+                    )
+                ),
+            }
         )
-    ]
 
+    settings["routes"] = clean
 
-# ============================================================
-# POSTS
-# ============================================================
-
-async def get_posts() -> list[dict[str, Any]]:
-
-    data = await read_json(
-        POSTS_FILE
-    )
-
-    posts = data.get(
-        "posts",
-        [],
-    )
-
-    return (
-        posts
-        if isinstance(posts, list)
-        else []
-    )
-
-
-async def save_posts(
-    posts: list[dict[str, Any]],
-) -> None:
-
-    await write_json(
-        POSTS_FILE,
-        {
-            "posts": posts
-        },
-    )
+    await save_settings(settings)
 
 
 # ============================================================
@@ -558,12 +623,16 @@ async def save_posts(
 
 async def get_schedule() -> dict[str, Any]:
 
-    data = await read_json(
-        SCHEDULE_FILE
+    data = await _read(
+        SCHEDULE_FILE,
+        {},
     )
 
-    result = _clone(
-        DEFAULTS[SCHEDULE_FILE]
+    if not isinstance(data, dict):
+        data = {}
+
+    result = dict(
+        DEFAULT_SCHEDULE
     )
 
     result.update(data)
@@ -575,36 +644,23 @@ async def save_schedule(
     schedule: dict[str, Any],
 ) -> None:
 
-    await write_json(
+    current = dict(
+        DEFAULT_SCHEDULE
+    )
+
+    current.update(schedule)
+
+    await _write(
         SCHEDULE_FILE,
-        schedule,
+        current,
     )
 
 
 # ============================================================
-# SETTINGS
+# TIME
 # ============================================================
 
-async def get_settings() -> dict[str, Any]:
-
-    data = await read_json(
-        SETTINGS_FILE
-    )
-
-    result = _clone(
-        DEFAULTS[SETTINGS_FILE]
-    )
-
-    result.update(data)
-
-    return result
-
-
-async def save_settings(
-    settings: dict[str, Any],
-) -> None:
-
-    await write_json(
-        SETTINGS_FILE,
-        settings,
-    )
+def now_iso() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
