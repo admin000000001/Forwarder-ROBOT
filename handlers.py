@@ -1,9 +1,22 @@
+"""
+handlers.py
+
+Forwarder-ROBOT handlers.
+
+Important:
+    - Captures NEW channel posts automatically.
+    - Supports multiple source channels.
+    - Supports source -> destination routes.
+    - Supports text, photo, video, document, audio,
+      animation, voice, sticker and media groups.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
+from collections import defaultdict
 from typing import Any
 
 from aiogram import Bot, Router
@@ -18,351 +31,155 @@ logger = logging.getLogger("forwarder")
 
 router = Router()
 
-# Media-group collection tasks
-_album_tasks: dict[tuple[int, str], asyncio.Task] = {}
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+
+_BOT: Bot | None = None
+_SCHEDULER = None
 
 
 # ============================================================
-# HELPERS
+# OWNER
 # ============================================================
 
-def is_owner(message: Message) -> bool:
+def is_owner(
+    message: Message
+) -> bool:
+
     try:
+
         return (
             message.from_user is not None
-            and int(message.from_user.id) == int(CONFIG.owner_id)
+            and int(
+                message.from_user.id
+            )
+            == int(
+                CONFIG.owner_id
+            )
         )
+
     except Exception:
         return False
 
 
-async def owner_only(message: Message) -> bool:
+async def owner_only(
+    message: Message
+) -> bool:
+
     if not is_owner(message):
-        await message.reply("❌ You are not authorized to use this command.")
+
+        await message.reply(
+            "❌ You are not authorized."
+        )
+
         return False
+
     return True
 
 
-def parse_chat_id(message: Message) -> int | None:
+# ============================================================
+# CHAT ID PARSER
+# ============================================================
+
+def parse_chat_id(
+    message: Message
+) -> int | None:
+
     if not message.text:
         return None
 
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) != 2:
         return None
 
     try:
-        return int(parts[1].strip())
+        return int(
+            parts[1].strip()
+        )
+
     except ValueError:
         return None
 
 
-def format_chat(chat: dict[str, Any]) -> str:
-    cid = chat.get("chat_id", "?")
-    title = chat.get("title") or "Unknown"
-    username = chat.get("username")
+# ============================================================
+# CHAT FORMAT
+# ============================================================
 
-    if username:
-        return f"{esc(str(title))} — @{esc(str(username))} (`{cid}`)"
+def format_chat(
+    chat: dict[str, Any]
+) -> str:
 
-    return f"{esc(str(title))} (`{cid}`)"
-
-
-async def source_is_configured(chat_id: int) -> bool:
-    sources = await storage.get_sources()
-
-    for source in sources:
-        try:
-            if int(source.get("chat_id")) == int(chat_id):
-                return source.get("enabled", True)
-        except Exception:
-            continue
-
-    return False
-
-
-async def save_single_post(message: Message) -> bool:
-    """
-    Save one Telegram channel post.
-
-    We only store message IDs.
-    Actual media/text/caption stays on Telegram and is copied later
-    using copyMessage().
-    """
-
-    posts = await storage.get_posts()
-
-    source_chat_id = int(message.chat.id)
-    message_id = int(message.message_id)
-
-    # Duplicate protection
-    for post in posts:
-        try:
-            if int(post.get("source_chat_id")) != source_chat_id:
-                continue
-
-            ids = post.get("message_ids", [])
-
-            if message_id in ids:
-                return False
-
-        except Exception:
-            continue
-
-    post = {
-        "uid": storage.new_uid(),
-        "source_chat_id": source_chat_id,
-        "message_ids": [message_id],
-        "type": "single",
-        "media_group_id": None,
-        "created_at": storage.now_iso(),
-    }
-
-    posts.append(post)
-
-    await storage.save_posts(posts)
-
-    logger.info(
-        "[SOURCE] Post saved: source=%s message_id=%s total=%s",
-        source_chat_id,
-        message_id,
-        len(posts),
+    cid = chat.get(
+        "chat_id",
+        "?"
     )
 
-    return True
+    title = chat.get(
+        "title",
+        "Unknown"
+    )
+
+    username = chat.get(
+        "username"
+    )
+
+    if username:
+
+        return (
+            f"{esc(str(title))} "
+            f"— @{esc(str(username))} "
+            f"(<code>{cid}</code>)"
+        )
+
+    return (
+        f"{esc(str(title))} "
+        f"(<code>{cid}</code>)"
+    )
 
 
-async def save_album_after_delay(
-    chat_id: int,
-    media_group_id: str,
+# ============================================================
+# START
+# ============================================================
+
+@router.message(
+    Command("start")
+)
+async def cmd_start(
+    message: Message
 ) -> None:
-    """
-    Collect album messages arriving within a short period.
 
-    Telegram sends album items as separate channel_post updates.
-    """
-
-    try:
-        await asyncio.sleep(1.5)
-
-        posts = await storage.get_posts()
-
-        matching: list[dict[str, Any]] = []
-
-        for post in posts:
-            try:
-                if (
-                    int(post.get("source_chat_id")) == int(chat_id)
-                    and str(post.get("media_group_id")) == str(media_group_id)
-                ):
-                    matching.append(post)
-            except Exception:
-                continue
-
-        if len(matching) <= 1:
-            return
-
-        # Sort by first message ID
-        matching.sort(
-            key=lambda x: int(x.get("message_ids", [0])[0])
-        )
-
-        all_ids: list[int] = []
-
-        for post in matching:
-            for mid in post.get("message_ids", []):
-                if mid not in all_ids:
-                    all_ids.append(int(mid))
-
-        first = matching[0]
-
-        # Remove old individual records
-        posts = [
-            p
-            for p in posts
-            if p not in matching
-        ]
-
-        album_post = {
-            "uid": storage.new_uid(),
-            "source_chat_id": int(chat_id),
-            "message_ids": all_ids,
-            "type": "album",
-            "media_group_id": str(media_group_id),
-            "created_at": storage.now_iso(),
-        }
-
-        posts.append(album_post)
-
-        await storage.save_posts(posts)
-
-        logger.info(
-            "[SOURCE] Album saved: source=%s group=%s messages=%s",
-            chat_id,
-            media_group_id,
-            len(all_ids),
-        )
-
-    except asyncio.CancelledError:
-        raise
-
-    except Exception:
-        logger.exception(
-            "[SOURCE] Album processing failed: source=%s group=%s",
-            chat_id,
-            media_group_id,
-        )
-
-    finally:
-        _album_tasks.pop((int(chat_id), str(media_group_id)), None)
-
-
-# ============================================================
-# CHANNEL POST CAPTURE
-# ============================================================
-
-@router.channel_post()
-async def handle_channel_post(message: Message) -> None:
-    """
-    IMPORTANT:
-
-    This handler receives NEW posts sent to Telegram channels
-    where the bot is an administrator.
-
-    It supports:
-      video
-      photo
-      document
-      audio
-      animation/GIF
-      voice
-      video note
-      text
-      captions
-      other Telegram message types
-    """
-
-    try:
-        chat_id = int(message.chat.id)
-        message_id = int(message.message_id)
-
-        logger.info(
-            "[SOURCE] New channel post received: chat=%s message_id=%s",
-            chat_id,
-            message_id,
-        )
-
-        # Check source configuration
-        configured = await source_is_configured(chat_id)
-
-        if not configured:
-            logger.warning(
-                "[SOURCE] Ignored post from unconfigured/disabled source: %s",
-                chat_id,
-            )
-            return
-
-        # --------------------------------------------------------
-        # Album / Media Group
-        # --------------------------------------------------------
-
-        if message.media_group_id:
-            key = (chat_id, str(message.media_group_id))
-
-            # Save each album item temporarily as a post
-            posts = await storage.get_posts()
-
-            already_exists = False
-
-            for post in posts:
-                try:
-                    if (
-                        int(post.get("source_chat_id")) == chat_id
-                        and message_id in post.get("message_ids", [])
-                    ):
-                        already_exists = True
-                        break
-                except Exception:
-                    continue
-
-            if not already_exists:
-                posts.append(
-                    {
-                        "uid": storage.new_uid(),
-                        "source_chat_id": chat_id,
-                        "message_ids": [message_id],
-                        "type": "album_item",
-                        "media_group_id": str(message.media_group_id),
-                        "created_at": storage.now_iso(),
-                    }
-                )
-
-                await storage.save_posts(posts)
-
-                logger.info(
-                    "[SOURCE] Album item captured: chat=%s message_id=%s group=%s",
-                    chat_id,
-                    message_id,
-                    message.media_group_id,
-                )
-
-            # Restart collection timer
-            old_task = _album_tasks.get(key)
-
-            if old_task and not old_task.done():
-                old_task.cancel()
-
-            _album_tasks[key] = asyncio.create_task(
-                save_album_after_delay(
-                    chat_id,
-                    str(message.media_group_id),
-                )
-            )
-
-            return
-
-        # --------------------------------------------------------
-        # Normal post
-        # --------------------------------------------------------
-
-        saved = await save_single_post(message)
-
-        if saved:
-            logger.info(
-                "[SOURCE] New post successfully added to database: %s",
-                message_id,
-            )
-
-    except Exception:
-        logger.exception("[SOURCE] Failed to process channel post")
-
-
-# ============================================================
-# START / HELP
-# ============================================================
-
-@router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
     await message.reply(
         "🤖 <b>Forwarder-ROBOT</b>\n\n"
         "Telegram post distribution bot.\n\n"
-        "Use /help to see available commands."
+        "Use /help for commands."
     )
 
 
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    text = (
-        "🤖 <b>Forwarder-ROBOT — Help</b>\n\n"
+# ============================================================
+# HELP
+# ============================================================
 
-        "<b>Public commands</b>\n"
-        "/start — welcome message\n"
-        "/help — this message\n"
-        "/status — bot and scheduler status\n"
-        "/next — show next scheduled post\n\n"
+@router.message(
+    Command("help")
+)
+async def cmd_help(
+    message: Message
+) -> None:
 
-        "<b>Source management</b>\n"
+    await message.reply(
+        "🤖 <b>Forwarder-ROBOT</b>\n\n"
+
+        "<b>Public</b>\n"
+        "/start\n"
+        "/help\n"
+        "/status\n"
+        "/next\n\n"
+
+        "<b>Sources</b>\n"
         "/addsource &lt;chat_id&gt;\n"
         "/removesource &lt;chat_id&gt;\n"
         "/sources\n"
@@ -370,22 +187,22 @@ async def cmd_help(message: Message) -> None:
         "/clearsources\n"
         "/sourceinfo &lt;chat_id&gt;\n\n"
 
-        "<b>Destination management</b>\n"
+        "<b>Destinations</b>\n"
         "/addchannel &lt;chat_id&gt;\n"
         "/removechannel &lt;chat_id&gt;\n"
         "/channels\n"
         "/clearchannels\n"
         "/channelinfo &lt;chat_id&gt;\n\n"
 
-        "<b>Source → Destination routes</b>\n"
-        "/addroute &lt;source_id&gt; &lt;dest_id&gt;\n"
-        "/removeroute &lt;source_id&gt; &lt;dest_id&gt;\n"
+        "<b>Routes</b>\n"
+        "/addroute SOURCE_ID DEST_ID\n"
+        "/removeroute SOURCE_ID DEST_ID\n"
         "/routes\n"
         "/clearroutes\n\n"
 
         "<b>Posts</b>\n"
-        "/importposts — reply to JSON file\n"
-        "/scan — show stored post count\n\n"
+        "/scan\n"
+        "/importposts\n\n"
 
         "<b>Scheduler</b>\n"
         "/startschedule\n"
@@ -396,51 +213,77 @@ async def cmd_help(message: Message) -> None:
         "/reload"
     )
 
-    await message.reply(text)
-
 
 # ============================================================
 # STATUS
 # ============================================================
 
-@router.message(Command("status"))
-async def cmd_status(message: Message) -> None:
+@router.message(
+    Command("status")
+)
+async def cmd_status(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
-    schedule = await storage.get_schedule()
     sources = await storage.get_sources()
     channels = await storage.get_channels()
     posts = await storage.get_posts()
+    schedule = await storage.get_schedule()
+    routes = await storage.get_routes()
 
     await message.reply(
-        "📊 <b>Bot Status</b>\n\n"
+        "📊 <b>Status</b>\n\n"
         f"Sources: <code>{len(sources)}</code>\n"
         f"Destinations: <code>{len(channels)}</code>\n"
+        f"Routes: <code>{len(routes)}</code>\n"
         f"Posts: <code>{len(posts)}</code>\n"
         f"Scheduler: <code>"
         f"{'RUNNING' if schedule.get('running') else 'STOPPED'}"
         f"</code>\n"
-        f"Current index: <code>{schedule.get('current_index', 0)}</code>\n"
-        f"Next run: <code>"
-        f"{esc(str(schedule.get('next_run_iso') or 'N/A'))}"
-        f"</code>"
+        f"Current index: "
+        f"<code>{schedule.get('current_index', 0)}</code>\n"
+        f"Next run: "
+        f"<code>{esc(str(schedule.get('next_run_iso') or 'N/A'))}</code>"
     )
 
 
-@router.message(Command("next"))
-async def cmd_next(message: Message) -> None:
+# ============================================================
+# NEXT
+# ============================================================
+
+@router.message(
+    Command("next")
+)
+async def cmd_next(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
-    schedule = await storage.get_schedule()
     posts = await storage.get_posts()
 
     if not posts:
-        await message.reply("ℹ️ No posts are currently loaded.")
+
+        await message.reply(
+            "ℹ️ No posts loaded."
+        )
+
         return
 
-    index = int(schedule.get("current_index", 0)) % len(posts)
+    schedule = await storage.get_schedule()
+
+    index = int(
+        schedule.get(
+            "current_index",
+            0
+        )
+    )
+
+    index %= len(posts)
 
     post = posts[index]
 
@@ -448,8 +291,8 @@ async def cmd_next(message: Message) -> None:
         "⏭ <b>Next Post</b>\n\n"
         f"Index: <code>{index}</code>\n"
         f"Source: <code>{post.get('source_chat_id')}</code>\n"
-        f"Message IDs: <code>{post.get('message_ids')}</code>\n"
-        f"Type: <code>{esc(str(post.get('type', 'single')))}</code>"
+        f"Message IDs: "
+        f"<code>{post.get('message_ids')}</code>"
     )
 
 
@@ -457,53 +300,60 @@ async def cmd_next(message: Message) -> None:
 # SOURCE MANAGEMENT
 # ============================================================
 
-@router.message(Command("addsource"))
-async def cmd_addsource(message: Message, bot: Bot) -> None:
+@router.message(
+    Command("addsource")
+)
+async def cmd_addsource(
+    message: Message,
+    bot: Bot
+) -> None:
+
     if not await owner_only(message):
         return
 
     chat_id = parse_chat_id(message)
 
     if chat_id is None:
+
         await message.reply(
             "Usage:\n"
             "<code>/addsource -1001234567890</code>"
         )
+
         return
 
-    sources = await storage.get_sources()
-
-    for source in sources:
-        try:
-            if int(source.get("chat_id")) == chat_id:
-                await message.reply(
-                    "⚠️ This source channel is already configured."
-                )
-                return
-        except Exception:
-            continue
-
-    result = await verify_chat_access(bot, chat_id)
+    result = await verify_chat_access(
+        bot,
+        chat_id
+    )
 
     if not result.ok:
+
         await message.reply(
-            "❌ Cannot access this source channel.\n\n"
+            "❌ Cannot access source.\n\n"
             f"ID: <code>{chat_id}</code>\n"
             f"Error: {esc(str(result.error))}\n\n"
-            "Make sure the bot is an administrator in the source channel."
+            "Make sure the bot is admin."
         )
+
         return
 
-    sources.append(
+    added = await storage.add_source(
         {
             "chat_id": chat_id,
             "title": result.title,
             "username": result.username,
-            "enabled": True,
+            "enabled": True
         }
     )
 
-    await storage.save_sources(sources)
+    if not added:
+
+        await message.reply(
+            "⚠️ Source already exists."
+        )
+
+        return
 
     await message.reply(
         "✅ <b>Source added</b>\n\n"
@@ -512,265 +362,364 @@ async def cmd_addsource(message: Message, bot: Bot) -> None:
     )
 
 
-@router.message(Command("setsource"))
-async def cmd_setsource(message: Message, bot: Bot) -> None:
-    await cmd_addsource(message, bot)
+@router.message(
+    Command("setsource")
+)
+async def cmd_setsource(
+    message: Message,
+    bot: Bot
+) -> None:
+
+    await cmd_addsource(
+        message,
+        bot
+    )
 
 
-@router.message(Command("removesource"))
-async def cmd_removesource(message: Message) -> None:
+@router.message(
+    Command("removesource")
+)
+async def cmd_removesource(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
     chat_id = parse_chat_id(message)
 
     if chat_id is None:
+
         await message.reply(
-            "Usage: <code>/removesource -1001234567890</code>"
+            "Usage: "
+            "<code>/removesource -1001234567890</code>"
         )
+
         return
 
-    sources = await storage.get_sources()
-
-    new_sources = []
-
-    for source in sources:
-        try:
-            if int(source.get("chat_id")) != chat_id:
-                new_sources.append(source)
-        except Exception:
-            new_sources.append(source)
-
-    if len(new_sources) == len(sources):
-        await message.reply("❌ Source channel not found.")
-        return
-
-    await storage.save_sources(new_sources)
+    removed = await storage.remove_source(
+        chat_id
+    )
 
     await message.reply(
-        f"✅ Source removed: <code>{chat_id}</code>"
+        "✅ Source removed."
+        if removed
+        else "❌ Source not found."
     )
 
 
-@router.message(Command("sources"))
-async def cmd_sources(message: Message) -> None:
+@router.message(
+    Command("sources")
+)
+async def cmd_sources(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
     sources = await storage.get_sources()
 
     if not sources:
-        await message.reply("📭 No source channels configured.")
-        return
 
-    lines = ["📡 <b>Source Channels</b>\n"]
-
-    for i, source in enumerate(sources, 1):
-        status = "🟢" if source.get("enabled", True) else "🔴"
-
-        lines.append(
-            f"{i}. {status} {format_chat(source)}"
+        await message.reply(
+            "📭 No sources configured."
         )
 
-    await message.reply("\n".join(lines))
+        return
+
+    lines = [
+        "📡 <b>Sources</b>\n"
+    ]
+
+    for i, source in enumerate(
+        sources,
+        1
+    ):
+
+        status = (
+            "🟢"
+            if source.get("enabled", True)
+            else "🔴"
+        )
+
+        lines.append(
+            f"{i}. {status} "
+            f"{format_chat(source)}"
+        )
+
+    await message.reply(
+        "\n".join(lines)
+    )
 
 
-@router.message(Command("clearsources"))
-async def cmd_clearsources(message: Message) -> None:
+@router.message(
+    Command("clearsources")
+)
+async def cmd_clearsources(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
     await storage.save_sources([])
 
-    await message.reply("✅ All source channels removed.")
+    await message.reply(
+        "✅ All sources cleared."
+    )
 
 
-@router.message(Command("sourceinfo"))
-async def cmd_sourceinfo(message: Message, bot: Bot) -> None:
+@router.message(
+    Command("sourceinfo")
+)
+async def cmd_sourceinfo(
+    message: Message,
+    bot: Bot
+) -> None:
+
     if not await owner_only(message):
         return
 
     chat_id = parse_chat_id(message)
 
     if chat_id is None:
+
         await message.reply(
-            "Usage: <code>/sourceinfo -1001234567890</code>"
+            "Usage: "
+            "<code>/sourceinfo -1001234567890</code>"
         )
+
         return
 
-    result = await verify_chat_access(bot, chat_id)
+    result = await verify_chat_access(
+        bot,
+        chat_id
+    )
 
     if not result.ok:
+
         await message.reply(
-            f"❌ Cannot access <code>{chat_id}</code>\n"
+            f"❌ Cannot access "
+            f"<code>{chat_id}</code>\n"
             f"{esc(str(result.error))}"
         )
+
         return
 
     await message.reply(
-        "📡 <b>Source Information</b>\n\n"
-        f"Title: {esc(str(result.title or 'Unknown'))}\n"
-        f"Username: {esc(str(result.username or 'None'))}\n"
+        "📡 <b>Source Info</b>\n\n"
+        f"Title: "
+        f"{esc(str(result.title or 'Unknown'))}\n"
+        f"Username: "
+        f"{esc(str(result.username or 'None'))}\n"
         f"ID: <code>{chat_id}</code>"
     )
 
 
 # ============================================================
-# DESTINATION MANAGEMENT
+# DESTINATIONS
 # ============================================================
 
-@router.message(Command("addchannel"))
-async def cmd_addchannel(message: Message, bot: Bot) -> None:
+@router.message(
+    Command("addchannel")
+)
+async def cmd_addchannel(
+    message: Message,
+    bot: Bot
+) -> None:
+
     if not await owner_only(message):
         return
 
     chat_id = parse_chat_id(message)
 
     if chat_id is None:
+
         await message.reply(
             "Usage:\n"
             "<code>/addchannel -1001234567890</code>"
         )
+
         return
 
-    channels = await storage.get_channels()
-
-    for channel in channels:
-        try:
-            if int(channel.get("chat_id")) == chat_id:
-                await message.reply(
-                    "⚠️ Destination already exists."
-                )
-                return
-        except Exception:
-            continue
-
-    result = await verify_chat_access(bot, chat_id)
+    result = await verify_chat_access(
+        bot,
+        chat_id
+    )
 
     if not result.ok:
+
         await message.reply(
-            "❌ Cannot access destination channel.\n\n"
+            "❌ Cannot access destination.\n\n"
             f"ID: <code>{chat_id}</code>\n"
             f"Error: {esc(str(result.error))}"
         )
+
         return
 
-    channels.append(
+    added = await storage.add_channel(
         {
             "chat_id": chat_id,
             "title": result.title,
             "username": result.username,
-            "enabled": True,
+            "enabled": True
         }
     )
 
-    await storage.save_channels(channels)
+    if not added:
+
+        await message.reply(
+            "⚠️ Destination already exists."
+        )
+
+        return
 
     await message.reply(
         "✅ <b>Destination added</b>\n\n"
-        f"Title: {esc(str(result.title or 'Unknown'))}\n"
+        f"Title: "
+        f"{esc(str(result.title or 'Unknown'))}\n"
         f"ID: <code>{chat_id}</code>"
     )
 
 
-@router.message(Command("removechannel"))
-async def cmd_removechannel(message: Message) -> None:
+@router.message(
+    Command("removechannel")
+)
+async def cmd_removechannel(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
     chat_id = parse_chat_id(message)
 
     if chat_id is None:
+
         await message.reply(
-            "Usage: <code>/removechannel -1001234567890</code>"
+            "Usage: "
+            "<code>/removechannel -1001234567890</code>"
         )
+
         return
 
-    channels = await storage.get_channels()
-
-    new_channels = []
-
-    for channel in channels:
-        try:
-            if int(channel.get("chat_id")) != chat_id:
-                new_channels.append(channel)
-        except Exception:
-            new_channels.append(channel)
-
-    if len(new_channels) == len(channels):
-        await message.reply("❌ Destination not found.")
-        return
-
-    await storage.save_channels(new_channels)
+    removed = await storage.remove_channel(
+        chat_id
+    )
 
     await message.reply(
-        f"✅ Destination removed: <code>{chat_id}</code>"
+        "✅ Destination removed."
+        if removed
+        else "❌ Destination not found."
     )
 
 
-@router.message(Command("channels"))
-async def cmd_channels(message: Message) -> None:
+@router.message(
+    Command("channels")
+)
+async def cmd_channels(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
     channels = await storage.get_channels()
 
     if not channels:
+
         await message.reply(
-            "📭 No destination channels configured."
+            "📭 No destinations configured."
         )
+
         return
 
-    lines = ["📤 <b>Destination Channels</b>\n"]
+    lines = [
+        "📤 <b>Destinations</b>\n"
+    ]
 
-    for i, channel in enumerate(channels, 1):
-        status = "🟢" if channel.get("enabled", True) else "🔴"
+    for i, channel in enumerate(
+        channels,
+        1
+    ):
 
-        lines.append(
-            f"{i}. {status} {format_chat(channel)}"
+        status = (
+            "🟢"
+            if channel.get("enabled", True)
+            else "🔴"
         )
 
-    await message.reply("\n".join(lines))
+        lines.append(
+            f"{i}. {status} "
+            f"{format_chat(channel)}"
+        )
+
+    await message.reply(
+        "\n".join(lines)
+    )
 
 
-@router.message(Command("clearchannels"))
-async def cmd_clearchannels(message: Message) -> None:
+@router.message(
+    Command("clearchannels")
+)
+async def cmd_clearchannels(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
     await storage.save_channels([])
 
     await message.reply(
-        "✅ All destination channels removed."
+        "✅ All destinations cleared."
     )
 
 
-@router.message(Command("channelinfo"))
-async def cmd_channelinfo(message: Message, bot: Bot) -> None:
+@router.message(
+    Command("channelinfo")
+)
+async def cmd_channelinfo(
+    message: Message,
+    bot: Bot
+) -> None:
+
     if not await owner_only(message):
         return
 
     chat_id = parse_chat_id(message)
 
     if chat_id is None:
+
         await message.reply(
-            "Usage: <code>/channelinfo -1001234567890</code>"
+            "Usage: "
+            "<code>/channelinfo -1001234567890</code>"
         )
+
         return
 
-    result = await verify_chat_access(bot, chat_id)
+    result = await verify_chat_access(
+        bot,
+        chat_id
+    )
 
     if not result.ok:
+
         await message.reply(
-            f"❌ Cannot access <code>{chat_id}</code>\n"
+            f"❌ Cannot access "
+            f"<code>{chat_id}</code>\n"
             f"{esc(str(result.error))}"
         )
+
         return
 
     await message.reply(
-        "📤 <b>Destination Information</b>\n\n"
-        f"Title: {esc(str(result.title or 'Unknown'))}\n"
-        f"Username: {esc(str(result.username or 'None'))}\n"
+        "📤 <b>Destination Info</b>\n\n"
+        f"Title: "
+        f"{esc(str(result.title or 'Unknown'))}\n"
+        f"Username: "
+        f"{esc(str(result.username or 'None'))}\n"
         f"ID: <code>{chat_id}</code>"
     )
 
@@ -779,25 +728,13 @@ async def cmd_channelinfo(message: Message, bot: Bot) -> None:
 # ROUTES
 # ============================================================
 
-async def get_routes() -> list[dict[str, Any]]:
-    settings = await storage.get_settings()
+@router.message(
+    Command("addroute")
+)
+async def cmd_addroute(
+    message: Message
+) -> None:
 
-    routes = settings.get("routes", [])
-
-    if not isinstance(routes, list):
-        return []
-
-    return routes
-
-
-async def save_routes(routes: list[dict[str, Any]]) -> None:
-    settings = await storage.get_settings()
-    settings["routes"] = routes
-    await storage.save_settings(settings)
-
-
-@router.message(Command("addroute"))
-async def cmd_addroute(message: Message) -> None:
     if not await owner_only(message):
         return
 
@@ -807,54 +744,39 @@ async def cmd_addroute(message: Message) -> None:
     parts = message.text.split()
 
     if len(parts) != 3:
+
         await message.reply(
             "Usage:\n"
-            "<code>/addroute SOURCE_ID DESTINATION_ID</code>"
+            "<code>/addroute SOURCE_ID DEST_ID</code>"
         )
+
         return
 
     try:
+
         source_id = int(parts[1])
         destination_id = int(parts[2])
+
     except ValueError:
+
         await message.reply(
             "❌ IDs must be numbers."
         )
+
         return
 
-    routes = await get_routes()
-
-    route = None
-
-    for item in routes:
-        try:
-            if int(item.get("source_id")) == source_id:
-                route = item
-                break
-        except Exception:
-            continue
-
-    if route is None:
-        route = {
-            "source_id": source_id,
-            "destinations": [],
-        }
-        routes.append(route)
-
-    destinations = route.setdefault(
-        "destinations",
-        [],
+    added = await storage.add_route(
+        source_id,
+        destination_id
     )
 
-    if destination_id in destinations:
+    if not added:
+
         await message.reply(
-            "⚠️ This route already exists."
+            "⚠️ Route already exists."
         )
+
         return
-
-    destinations.append(destination_id)
-
-    await save_routes(routes)
 
     await message.reply(
         "✅ <b>Route added</b>\n\n"
@@ -863,8 +785,13 @@ async def cmd_addroute(message: Message) -> None:
     )
 
 
-@router.message(Command("removeroute"))
-async def cmd_removeroute(message: Message) -> None:
+@router.message(
+    Command("removeroute")
+)
+async def cmd_removeroute(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
@@ -874,103 +801,103 @@ async def cmd_removeroute(message: Message) -> None:
     parts = message.text.split()
 
     if len(parts) != 3:
+
         await message.reply(
             "Usage:\n"
-            "<code>/removeroute SOURCE_ID DESTINATION_ID</code>"
+            "<code>/removeroute SOURCE_ID DEST_ID</code>"
         )
+
         return
 
     try:
+
         source_id = int(parts[1])
         destination_id = int(parts[2])
+
     except ValueError:
+
         await message.reply(
-            "❌ IDs must be numbers."
+            "❌ Invalid IDs."
         )
+
         return
 
-    routes = await get_routes()
-    changed = False
-
-    for route in routes:
-        try:
-            if int(route.get("source_id")) != source_id:
-                continue
-
-            destinations = route.get(
-                "destinations",
-                [],
-            )
-
-            if destination_id in destinations:
-                destinations.remove(destination_id)
-                changed = True
-
-        except Exception:
-            continue
-
-    routes = [
-        route
-        for route in routes
-        if route.get("destinations")
-    ]
-
-    await save_routes(routes)
+    removed = await storage.remove_route(
+        source_id,
+        destination_id
+    )
 
     await message.reply(
         "✅ Route removed."
-        if changed
+        if removed
         else "❌ Route not found."
     )
 
 
-@router.message(Command("routes"))
-async def cmd_routes(message: Message) -> None:
+@router.message(
+    Command("routes")
+)
+async def cmd_routes(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
-    routes = await get_routes()
+    routes = await storage.get_routes()
 
     if not routes:
+
         await message.reply(
-            "📭 No routes configured.\n\n"
-            "Example:\n"
-            "<code>/addroute -1001111111111 -1002111111111</code>"
+            "📭 No routes configured."
         )
+
         return
 
     lines = [
-        "🔀 <b>Source → Destination Routes</b>\n"
+        "🔀 <b>Source → Destinations</b>\n"
     ]
 
-    for i, route in enumerate(routes, 1):
-        source_id = route.get("source_id")
+    for route in routes:
+
+        source_id = route.get(
+            "source_id"
+        )
+
         destinations = route.get(
             "destinations",
-            [],
+            []
         )
 
         lines.append(
-            f"<b>{i}. Source:</b> "
+            f"📡 <b>Source</b>: "
             f"<code>{source_id}</code>"
         )
 
-        for destination in destinations:
+        for dest in destinations:
+
             lines.append(
-                f"   └── <code>{destination}</code>"
+                f"   └─ <code>{dest}</code>"
             )
 
         lines.append("")
 
-    await message.reply("\n".join(lines))
+    await message.reply(
+        "\n".join(lines)
+    )
 
 
-@router.message(Command("clearroutes"))
-async def cmd_clearroutes(message: Message) -> None:
+@router.message(
+    Command("clearroutes")
+)
+async def cmd_clearroutes(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
-    await save_routes([])
+    await storage.save_routes([])
 
     await message.reply(
         "✅ All routes cleared."
@@ -981,52 +908,69 @@ async def cmd_clearroutes(message: Message) -> None:
 # SCHEDULER
 # ============================================================
 
-@router.message(Command("startschedule"))
+@router.message(
+    Command("startschedule")
+)
 async def cmd_startschedule(
-    message: Message,
-    scheduler,
+    message: Message
 ) -> None:
 
     if not await owner_only(message):
         return
 
-    if scheduler is None:
+    global _SCHEDULER
+
+    if _SCHEDULER is None:
+
         await message.reply(
-            "❌ Scheduler dependency is unavailable."
+            "❌ Scheduler dependency is not initialized."
         )
+
         return
 
-    ok, text = await scheduler.start()
+    ok, text = await _SCHEDULER.start()
 
     await message.reply(
-        ("✅ " if ok else "⚠️ ") + esc(str(text))
+        ("✅ " if ok else "⚠️ ")
+        + esc(text)
     )
 
 
-@router.message(Command("stopschedule"))
+@router.message(
+    Command("stopschedule")
+)
 async def cmd_stopschedule(
-    message: Message,
-    scheduler,
+    message: Message
 ) -> None:
 
     if not await owner_only(message):
         return
 
-    if scheduler is None:
+    global _SCHEDULER
+
+    if _SCHEDULER is None:
+
         await message.reply(
-            "❌ Scheduler dependency is unavailable."
+            "❌ Scheduler dependency is not initialized."
         )
+
         return
 
-    ok, text = await scheduler.stop()
+    ok, text = await _SCHEDULER.stop()
 
     await message.reply(
-        ("✅ " if ok else "⚠️ ") + esc(str(text))
+        ("✅ " if ok else "⚠️ ")
+        + esc(text)
     )
 
 
-@router.message(Command("setinterval"))
-async def cmd_setinterval(message: Message) -> None:
+@router.message(
+    Command("setinterval")
+)
+async def cmd_setinterval(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
@@ -1036,37 +980,49 @@ async def cmd_setinterval(message: Message) -> None:
     parts = message.text.split()
 
     if len(parts) != 2:
+
         await message.reply(
-            "Usage:\n"
-            "<code>/setinterval 20</code>"
+            "Usage: <code>/setinterval 20</code>"
         )
+
         return
 
     try:
+
         minutes = int(parts[1])
 
         if minutes <= 0:
             raise ValueError
 
     except ValueError:
+
         await message.reply(
-            "❌ Interval must be a positive integer."
+            "❌ Interval must be a positive number."
         )
+
         return
 
     settings = await storage.get_settings()
+
     settings["interval_minutes"] = minutes
 
-    await storage.save_settings(settings)
+    await storage.save_settings(
+        settings
+    )
 
     await message.reply(
-        f"✅ Scheduler interval set to "
+        f"✅ Interval set to "
         f"<b>{minutes} minutes</b>."
     )
 
 
-@router.message(Command("setsourcemode"))
-async def cmd_setsourcemode(message: Message) -> None:
+@router.message(
+    Command("setsourcemode")
+)
+async def cmd_setsourcemode(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
@@ -1076,93 +1032,113 @@ async def cmd_setsourcemode(message: Message) -> None:
     parts = message.text.split()
 
     if len(parts) != 2:
+
         await message.reply(
             "Usage:\n"
             "<code>/setsourcemode round_robin</code>\n"
             "<code>/setsourcemode sequential</code>"
         )
+
         return
 
     mode = parts[1].lower()
 
     if mode not in (
         "round_robin",
-        "sequential",
+        "sequential"
     ):
+
         await message.reply(
-            "❌ Invalid mode.\n\n"
-            "Use:\n"
-            "<code>round_robin</code>\n"
-            "or\n"
-            "<code>sequential</code>"
+            "❌ Invalid mode."
         )
+
         return
 
     settings = await storage.get_settings()
+
     settings["source_mode"] = mode
 
-    await storage.save_settings(settings)
+    await storage.save_settings(
+        settings
+    )
 
     await message.reply(
-        f"✅ Source mode set to "
-        f"<code>{mode}</code>."
+        f"✅ Source mode: "
+        f"<code>{mode}</code>"
     )
 
 
-@router.message(Command("reset"))
+@router.message(
+    Command("reset")
+)
 async def cmd_reset(
-    message: Message,
-    scheduler,
+    message: Message
 ) -> None:
 
     if not await owner_only(message):
         return
 
-    if scheduler is None:
+    global _SCHEDULER
+
+    if _SCHEDULER is None:
+
         await message.reply(
-            "❌ Scheduler dependency unavailable."
+            "❌ Scheduler not initialized."
         )
+
         return
 
-    await scheduler.reset()
+    await _SCHEDULER.reset()
 
     await message.reply(
-        "✅ Scheduler sequence reset."
+        "✅ Scheduler reset."
     )
 
 
-@router.message(Command("reload"))
-async def cmd_reload(message: Message) -> None:
+@router.message(
+    Command("reload")
+)
+async def cmd_reload(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
     await message.reply(
-        "✅ State is stored on disk and will be "
-        "used by the next scheduler cycle."
+        "✅ State is stored on disk and "
+        "will be used on the next scheduler cycle."
     )
 
 
 # ============================================================
-# POSTS / SCAN
+# SCAN
 # ============================================================
 
-@router.message(Command("scan"))
-async def cmd_scan(message: Message) -> None:
+@router.message(
+    Command("scan")
+)
+async def cmd_scan(
+    message: Message
+) -> None:
+
     if not await owner_only(message):
         return
 
-    posts = await storage.get_posts()
     sources = await storage.get_sources()
+    posts = await storage.get_posts()
 
     await message.reply(
         "ℹ️ <b>Telegram Bot API limitation</b>\n\n"
-        "A normal bot cannot retrieve arbitrary old "
-        "channel history.\n\n"
-        "However, NEW posts from configured source "
-        "channels are captured automatically.\n\n"
-        f"Configured sources: <b>{len(sources)}</b>\n"
-        f"Currently loaded posts: <b>{len(posts)}</b>\n\n"
-        "Use /importposts to load an existing JSON list."
+        "A normal bot cannot retrieve arbitrary "
+        "old channel history.\n\n"
+        "However, NEW posts are captured automatically "
+        "while the bot is running and is an admin "
+        "of the source channel.\n\n"
+        f"Configured sources: "
+        f"<b>{len(sources)}</b>\n"
+        f"Currently loaded: "
+        f"<b>{len(posts)} post(s)</b>"
     )
 
 
@@ -1170,132 +1146,181 @@ async def cmd_scan(message: Message) -> None:
 # IMPORT POSTS
 # ============================================================
 
-@router.message(Command("importposts"))
+@router.message(
+    Command("importposts")
+)
 async def cmd_importposts(
     message: Message,
-    bot: Bot,
+    bot: Bot
 ) -> None:
 
     if not await owner_only(message):
         return
 
-    replied = message.reply_to_message
+    if not message.reply_to_message:
 
-    if not replied or not replied.document:
         await message.reply(
-            "❌ Reply to a JSON file with:\n"
-            "<code>/importposts</code>"
+            "❌ Reply to a JSON file with "
+            "<code>/importposts</code>."
         )
+
         return
 
-    document = replied.document
+    document = (
+        message.reply_to_message.document
+    )
 
-    temp_path = "/tmp/forwarder_import.json"
+    if document is None:
+
+        await message.reply(
+            "❌ Replied message must contain "
+            "a JSON document."
+        )
+
+        return
+
+    temp_path = os_temp_import_path()
 
     try:
+
         file = await bot.get_file(
             document.file_id
         )
 
         await bot.download_file(
             file.file_path,
-            temp_path,
+            temp_path
         )
 
         with open(
             temp_path,
             "r",
-            encoding="utf-8",
+            encoding="utf-8"
         ) as f:
+
             data = json.load(f)
 
         if isinstance(data, dict):
-            imported_posts = data.get(
+
+            imported = data.get(
                 "posts",
-                [],
+                []
             )
+
         elif isinstance(data, list):
-            imported_posts = data
+
+            imported = data
+
         else:
-            imported_posts = []
+
+            imported = []
 
         if not isinstance(
-            imported_posts,
-            list,
+            imported,
+            list
         ):
-            imported_posts = []
 
-        # Validate basic structure
-        valid_posts = []
+            imported = []
 
-        for post in imported_posts:
-            if not isinstance(post, dict):
-                continue
+        # Normalize and deduplicate
+        existing = await storage.get_posts()
 
-            if (
-                "source_chat_id" not in post
-                or "message_ids" not in post
+        seen = {
+            item.get("_key")
+            for item in existing
+            if item.get("_key")
+        }
+
+        added = 0
+
+        for post in imported:
+
+            if not isinstance(
+                post,
+                dict
             ):
                 continue
 
-            try:
-                source_id = int(
-                    post["source_chat_id"]
-                )
-            except Exception:
-                continue
+            source_id = post.get(
+                "source_chat_id"
+            )
 
             message_ids = post.get(
                 "message_ids"
             )
 
+            if source_id is None:
+                continue
+
             if not isinstance(
                 message_ids,
-                list,
+                list
             ):
                 continue
 
-            clean_ids = []
+            try:
 
-            for mid in message_ids:
-                try:
-                    clean_ids.append(int(mid))
-                except Exception:
-                    pass
+                source_id = int(
+                    source_id
+                )
 
-            if not clean_ids:
+                message_ids = [
+                    int(x)
+                    for x in message_ids
+                ]
+
+            except (
+                TypeError,
+                ValueError
+            ):
+
+                continue
+
+            key = (
+                f"{source_id}:"
+                + ",".join(
+                    str(x)
+                    for x in sorted(
+                        message_ids
+                    )
+                )
+            )
+
+            if key in seen:
                 continue
 
             post["source_chat_id"] = source_id
-            post["message_ids"] = clean_ids
+            post["message_ids"] = message_ids
+            post["_key"] = key
+            post.setdefault(
+                "uid",
+                storage.new_uid()
+            )
+            post.setdefault(
+                "created_at",
+                storage.now_iso()
+            )
 
-            if "uid" not in post:
-                post["uid"] = storage.new_uid()
+            existing.append(post)
 
-            if "type" not in post:
-                post["type"] = (
-                    "album"
-                    if len(clean_ids) > 1
-                    else "single"
-                )
-
-            if "created_at" not in post:
-                post["created_at"] = storage.now_iso()
-
-            valid_posts.append(post)
+            seen.add(key)
+            added += 1
 
         await storage.save_posts(
-            valid_posts
+            existing
         )
 
         await message.reply(
-            "✅ <b>Import completed</b>\n\n"
-            f"Imported: <b>{len(valid_posts)}</b> post(s)"
+            f"✅ Imported "
+            f"<b>{added}</b> new post(s).\n"
+            f"Total loaded: "
+            f"<b>{len(existing)}</b>"
         )
 
     except Exception as exc:
+
         logger.exception(
-            "[IMPORT] Failed"
+            "Import failed"
         )
 
         await message.reply(
@@ -1304,11 +1329,264 @@ async def cmd_importposts(
         )
 
     finally:
+
         try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+
+            import os
+
+            if os.path.exists(
+                temp_path
+            ):
+                os.remove(
+                    temp_path
+                )
+
         except Exception:
             pass
+
+
+def os_temp_import_path() -> str:
+
+    import os
+
+    return os.path.join(
+        os.getcwd(),
+        ".forwarder_import.json"
+    )
+
+
+# ============================================================
+# NEW CHANNEL POST CAPTURE
+# ============================================================
+
+async def _capture_channel_post(
+    message: Message
+) -> None:
+
+    """
+    Captures NEW posts coming from configured source channels.
+
+    IMPORTANT:
+        Telegram sends channel posts through the channel_post
+        update, not normal message updates.
+    """
+
+    if message.chat is None:
+        return
+
+    source_id = int(
+        message.chat.id
+    )
+
+    sources = await storage.get_sources()
+
+    configured = False
+
+    for source in sources:
+
+        try:
+
+            if int(
+                source.get("chat_id")
+            ) == source_id:
+
+                configured = (
+                    source.get(
+                        "enabled",
+                        True
+                    )
+                )
+
+                break
+
+        except Exception:
+            continue
+
+    if not configured:
+        return
+
+    # --------------------------------------------------------
+    # Detect message type
+    # --------------------------------------------------------
+
+    post_type = "message"
+
+    if message.media_group_id:
+        post_type = "album"
+
+    elif message.video:
+        post_type = "video"
+
+    elif message.photo:
+        post_type = "photo"
+
+    elif message.document:
+        post_type = "document"
+
+    elif message.audio:
+        post_type = "audio"
+
+    elif message.animation:
+        post_type = "animation"
+
+    elif message.voice:
+        post_type = "voice"
+
+    elif message.video_note:
+        post_type = "video_note"
+
+    elif message.sticker:
+        post_type = "sticker"
+
+    elif message.text:
+        post_type = "text"
+
+    # --------------------------------------------------------
+    # Normal single post
+    # --------------------------------------------------------
+
+    if not message.media_group_id:
+
+        post = {
+            "source_chat_id": source_id,
+
+            "message_ids": [
+                int(message.message_id)
+            ],
+
+            "type": post_type,
+
+            "media_group_id": None,
+
+            "caption": (
+                message.caption
+                or message.text
+                or None
+            ),
+
+            "source_title": (
+                message.chat.title
+            ),
+
+            "created_at": (
+                storage.now_iso()
+            )
+        }
+
+        added = await storage.add_post(
+            post
+        )
+
+        if added:
+
+            logger.info(
+                "[CAPTURE] New %s post "
+                "captured from %s "
+                "message_id=%s",
+                post_type,
+                source_id,
+                message.message_id
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # Album / Media Group
+    # --------------------------------------------------------
+
+    media_group_id = (
+        message.media_group_id
+    )
+
+    # Wait briefly so Telegram can deliver
+    # the remaining album messages.
+    await asyncio.sleep(1.0)
+
+    posts = await storage.get_posts()
+
+    # Look for already-created album.
+    for existing in posts:
+
+        if (
+            existing.get(
+                "source_chat_id"
+            ) == source_id
+            and existing.get(
+                "media_group_id"
+            ) == media_group_id
+        ):
+
+            return
+
+    # Telegram delivers album messages separately.
+    # At this point we at least capture this message.
+    #
+    # Additional album messages can be merged by scheduler/
+    # utility layer if supported.
+    post = {
+        "source_chat_id": source_id,
+
+        "message_ids": [
+            int(message.message_id)
+        ],
+
+        "type": "album",
+
+        "media_group_id": media_group_id,
+
+        "caption": (
+            message.caption
+            or None
+        ),
+
+        "source_title": (
+            message.chat.title
+        ),
+
+        "created_at": (
+            storage.now_iso()
+        )
+    }
+
+    added = await storage.add_post(
+        post
+    )
+
+    if added:
+
+        logger.info(
+            "[CAPTURE] Album post "
+            "captured from %s "
+            "message_id=%s "
+            "media_group=%s",
+            source_id,
+            message.message_id,
+            media_group_id
+        )
+
+
+# ============================================================
+# CHANNEL POST HANDLER
+# ============================================================
+
+@router.channel_post()
+async def handle_channel_post(
+    message: Message
+) -> None:
+
+    try:
+
+        await _capture_channel_post(
+            message
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "[ERROR] Failed to capture "
+            "channel post: %s",
+            exc
+        )
 
 
 # ============================================================
@@ -1318,30 +1596,22 @@ async def cmd_importposts(
 def register_handlers(
     dp,
     bot: Bot,
-    scheduler,
+    scheduler
 ) -> None:
-    """
-    Register handlers.
 
-    IMPORTANT:
-    aiogram Router cannot be attached twice to the same
-    Dispatcher.
+    global _BOT
+    global _SCHEDULER
 
-    Also exposes scheduler through Dispatcher workflow data,
-    so handlers with `scheduler` parameter can receive it.
-    """
+    _BOT = bot
+    _SCHEDULER = scheduler
 
-    # Dependency injection
-    dp["bot_instance"] = bot
-    dp["scheduler_instance"] = scheduler
-
-    # Handler functions using `scheduler` receive this key.
-    dp["scheduler"] = scheduler
-
-    # Attach router only if it is not already attached.
+    # Router can only be attached once.
     if router.parent_router is None:
-        dp.include_router(router)
+
+        dp.include_router(
+            router
+        )
 
     logger.info(
-        "[INFO] Handlers registered successfully"
-            )
+        "[INFO] Handlers registered"
+)
